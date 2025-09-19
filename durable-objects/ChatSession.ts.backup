@@ -1,0 +1,3980 @@
+// @ts-ignore - Cloudflare Workers types
+import { DurableObject, DurableObjectStorage, DurableObjectState } from 'cloudflare:workers';
+import type {
+	WebSocketMessage,
+	ChatMessage,
+	ChatSession as IChatSession,
+	AIStreamChunk,
+} from '../types';
+import { IntelligentResponseService } from '../services/intelligentResponseService';
+import type { ResponseCraftingOptions } from '../services/intelligentResponseService';
+import { enhanceMCPResultForUser } from '../lib/responseFormatter';
+import { ContextSummarizer, type ContextSummary } from '../lib/contextSummarizer';
+
+// MCP Context Management Types
+interface MCPEntityContext {
+	contacts: Array<{ id: string; name: string; email: string; metadata?: any }>;
+	emails: Array<{ id: string; subject: string; status: string; metadata?: any }>;
+	meetings: Array<{ id: string; title: string; status: string; metadata?: any }>;
+	lastUpdated: number;
+}
+
+// Enhanced User Context Types
+interface UserPreferences {
+	communicationStyle: 'formal' | 'casual' | 'friendly' | 'professional';
+	responseLength: 'brief' | 'detailed' | 'comprehensive';
+	defaultTimezone: string;
+	workingHours: { start: string; end: string };
+	preferredMeetingDuration: number;
+	emailSignature: string;
+	notificationPreferences: string[];
+}
+
+interface ConversationContext {
+	userGoals: string[];
+	currentTasks: string[];
+	mentionedPreferences: Record<string, any>;
+	emotionalTone: 'neutral' | 'positive' | 'frustrated' | 'excited' | 'urgent';
+	conversationFlow: string[];
+	lastUserIntent: string;
+	pendingActions: string[];
+}
+
+interface MCPCacheEntry {
+	data: any;
+	expiry: number;
+	actionType: string;
+}
+
+interface MCPStatusUpdate {
+	status: 'thinking' | 'analyzing' | 'calling_tool' | 'processing_results' | 'completing';
+	action?: string;
+	details?: string;
+}
+
+interface Env {
+	SUPABASE_URL: string;
+	SUPABASE_SERVICE_ROLE_KEY: string;
+	OPENAI_API_KEY: string;
+	MCP_SERVER_URL: string;
+}
+
+export class ChatSession extends DurableObject {
+	private sessions: Map<string, IChatSession> = new Map();
+	private activeConnections: Map<string, WebSocket> = new Map();
+	private aiStreamController: ReadableStreamDefaultController | null = null;
+	private isStreaming = false;
+	private currentStreamAbortController: AbortController | null = null;
+	private workspaceId: string | null = null;
+	private currentUserId: string | null = null;
+	private supabaseEnabled: boolean = false;
+	private intelligentResponseService: IntelligentResponseService | null = null;
+	private env: Env;
+
+	constructor(state: DurableObjectState, env: Env) {
+		super(state, env);
+		this.env = env;
+		
+		// Initialize storage immediately
+		console.log('🏗️ ChatSession constructor called');
+		console.log('🏗️ Storage available:', !!this.storage);
+		console.log('🏗️ State available:', !!state);
+		
+		// Initialize storage and other components
+		this.initializeStorage().catch(error => {
+			console.error('❌ Failed to initialize storage in constructor:', error);
+		});
+	}
+
+	// Performance optimizations - Global MCP cache shared across all sessions
+	private static globalMCPCapabilitiesCache: any = null;
+	private static globalMCPCacheExpiry: number = 0;
+	private readonly MCP_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours - MCP capabilities rarely change
+	private readonly MCP_MEMORY_CACHE_TTL = 10 * 60 * 1000; // 10 minutes for memory-only mode
+	private messageBuffer: Map<string, any[]> = new Map();
+	private batchSaveTimeout: Map<string, NodeJS.Timeout> = new Map();
+	private readonly BATCH_SAVE_DELAY = 2000; // 2 seconds
+
+	// MCP Context Management
+	private sessionEntities = new Map<string, MCPEntityContext>();
+	private mcpResponseCache = new Map<string, MCPCacheEntry>();
+	private readonly MCP_RESPONSE_CACHE_TTL = 2 * 60 * 1000; // 2 minutes
+
+	// Enhanced User Context Management
+	private userPreferences = new Map<string, UserPreferences>();
+	private conversationContext = new Map<string, ConversationContext>();
+	private sessionPersonalities = new Map<string, string>(); // Custom AI personalities per session
+	private currentUserQueries = new Map<string, string>(); // Track current user query per session
+	private emailDrafts = new Map<string, string>(); // Track email drafts per session (sessionId -> email_id)
+
+	// Cloudflare Durable Object Storage Keys
+	private readonly STORAGE_KEYS = {
+		SESSION_ENTITIES: 'session_entities',
+		MCP_CACHE: 'mcp_cache',
+		GLOBAL_MCP_CAPABILITIES: 'global_mcp_capabilities', // Global cache key
+		GLOBAL_MCP_CACHE_EXPIRY: 'global_mcp_cache_expiry',
+		SESSION_ACTIONS: 'session_actions',
+		WORKSPACE_ID: 'workspace_id',
+		LAST_ACTIVITY: 'last_activity',
+		USER_PREFERENCES: 'user_preferences',
+		CONVERSATION_CONTEXT: 'conversation_context',
+		SESSION_PERSONALITIES: 'session_personalities',
+	};
+
+	// Connection health
+	private lastActivity = Date.now();
+	private readonly SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+
+	// Storage optimization settings
+	private readonly STORAGE_CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
+	private readonly MAX_STORAGE_SIZE = 100 * 1024; // 100KB per session
+	private readonly CACHE_CLEANUP_THRESHOLD = 50; // Clean when >50 entries
+
+	// Add storage property with proper typing
+	declare storage: DurableObjectStorage;
+
+	async fetch(request: Request): Promise<Response> {
+		const url = new URL(request.url);
+
+		// Initialize Cloudflare storage and Supabase
+		await this.initializeStorage();
+		this.initializeSupabase();
+
+		// Extract workspace ID and user ID from query parameters
+		const workspaceId = url.searchParams.get('workspaceId');
+		const userId = url.searchParams.get('userId');
+
+		if (workspaceId) {
+			this.workspaceId = workspaceId;
+			if (this.storage) {
+				await this.storage.put(this.STORAGE_KEYS.WORKSPACE_ID, workspaceId);
+			}
+		}
+
+		if (userId) {
+			console.log('👤 User ID set from query params:', userId);
+			// Store the user ID for use in session creation
+			this.currentUserId = userId;
+		} else {
+			console.warn('⚠️ User ID not provided in WebSocket connection - this may cause issues');
+		}
+
+		// Check if this is a WebSocket upgrade request
+		const upgradeHeader = request.headers.get('Upgrade');
+		if (upgradeHeader === 'websocket') {
+			return this.handleWebSocket(request);
+		}
+
+		if (url.pathname === '/api/chat') {
+			return this.handleChatAPI(request);
+		}
+
+		return new Response('Not found', { status: 404 });
+	}
+
+	private async initializeStorage(): Promise<void> {
+		try {
+			// Check if storage is available
+			console.log('🔍 Storage initialization check:');
+			console.log('  - this.storage:', !!this.storage);
+			console.log('  - typeof this.storage:', typeof this.storage);
+			console.log('  - this.storage methods:', this.storage ? Object.getOwnPropertyNames(Object.getPrototypeOf(this.storage)) : 'N/A');
+			
+			if (!this.storage) {
+				console.warn('⚠️ Durable Object storage not available - running in memory-only mode');
+				console.warn('⚠️ This will cause caching issues and frequent API calls');
+				return;
+			}
+			
+			console.log('✅ Durable Object storage is available - initializing persistent storage');
+
+			// Load workspace ID from storage
+			const storedWorkspaceId = await this.storage.get(this.STORAGE_KEYS.WORKSPACE_ID);
+			if (storedWorkspaceId && !this.workspaceId) {
+				this.workspaceId = storedWorkspaceId as string;
+				console.log('🏢 Workspace ID loaded from storage:', this.workspaceId);
+			}
+
+			// Load session entities from storage
+			const storedEntities = await this.storage.get(this.STORAGE_KEYS.SESSION_ENTITIES);
+			if (storedEntities) {
+				this.sessionEntities = new Map(
+					Object.entries(storedEntities as Record<string, MCPEntityContext>),
+				);
+				console.log('📦 Loaded', this.sessionEntities.size, 'session entities from storage');
+			}
+
+			// Load MCP cache from storage
+			const storedCache = await this.storage.get(this.STORAGE_KEYS.MCP_CACHE);
+			if (storedCache) {
+				this.mcpResponseCache = new Map(
+					Object.entries(storedCache as Record<string, MCPCacheEntry>),
+				);
+				console.log('💾 Loaded', this.mcpResponseCache.size, 'MCP cache entries from storage');
+			}
+
+			// Load last activity from storage
+			const storedActivity = await this.storage.get(this.STORAGE_KEYS.LAST_ACTIVITY);
+			if (storedActivity) {
+				this.lastActivity = storedActivity as number;
+			}
+
+			// Load user preferences from storage
+			const storedPreferences = await this.storage.get(this.STORAGE_KEYS.USER_PREFERENCES);
+			if (storedPreferences) {
+				this.userPreferences = new Map(
+					Object.entries(storedPreferences as Record<string, UserPreferences>),
+				);
+				console.log('👤 Loaded', this.userPreferences.size, 'user preferences from storage');
+			}
+
+			// Load conversation context from storage
+			const storedConversationContext = await this.storage.get(
+				this.STORAGE_KEYS.CONVERSATION_CONTEXT,
+			);
+			if (storedConversationContext) {
+				this.conversationContext = new Map(
+					Object.entries(storedConversationContext as Record<string, ConversationContext>),
+				);
+				console.log(
+					'💬 Loaded',
+					this.conversationContext.size,
+					'conversation contexts from storage',
+				);
+			}
+
+			// Load session personalities from storage
+			const storedPersonalities = await this.storage.get(this.STORAGE_KEYS.SESSION_PERSONALITIES);
+			if (storedPersonalities) {
+				this.sessionPersonalities = new Map(
+					Object.entries(storedPersonalities as Record<string, string>),
+				);
+				console.log(
+					'🎭 Loaded',
+					this.sessionPersonalities.size,
+					'session personalities from storage',
+				);
+			}
+
+			// Load global MCP capabilities cache from storage
+			await this.loadGlobalMCPCacheFromStorage();
+
+			console.log('✅ Cloudflare storage initialized');
+
+			// Schedule periodic cleanup
+			this.scheduleStorageCleanup();
+		} catch (error) {
+			console.error('❌ Failed to initialize Cloudflare storage:', error);
+		}
+	}
+
+	private initializeSupabase(): void {
+		try {
+			this.supabaseEnabled = !!(
+				this.env &&
+				this.env.SUPABASE_URL &&
+				this.env.SUPABASE_SERVICE_ROLE_KEY
+			);
+			if (this.supabaseEnabled) {
+				console.log('✅ Supabase integration enabled');
+			} else {
+				console.log('⚠️ Supabase integration disabled - missing environment variables');
+			}
+		} catch (error) {
+			console.warn('Failed to initialize Supabase:', error);
+			this.supabaseEnabled = false;
+		}
+	}
+
+	private getIntelligentResponseService(): IntelligentResponseService {
+		if (!this.intelligentResponseService) {
+			const openaiApiKey = this.env?.OPENAI_API_KEY;
+			if (!openaiApiKey) {
+				throw new Error('OpenAI API key not configured for intelligent responses');
+			}
+			this.intelligentResponseService = new IntelligentResponseService(openaiApiKey);
+		}
+		return this.intelligentResponseService;
+	}
+
+	private getSessionActions(sessionId: string): any[] {
+		const session = this.sessions.get(sessionId);
+		return session?.actions || [];
+	}
+
+	private async handleWebSocket(request: Request): Promise<Response> {
+		console.log('🔌 Setting up WebSocket connection');
+		// @ts-ignore - Cloudflare Workers WebSocketPair
+		const webSocketPair = new WebSocketPair();
+		const [client, server] = Object.values(webSocketPair) as [WebSocket, WebSocket];
+
+		(server as any).accept();
+		console.log('🔌 WebSocket server accepted');
+		this.setupWebSocketHandlers(server);
+
+		return new Response(null, {
+			status: 101,
+			webSocket: client,
+		} as any);
+	}
+
+	private setupWebSocketHandlers(webSocket: WebSocket): void {
+		console.log('🔌 Setting up WebSocket event handlers');
+
+		webSocket.addEventListener('message', async (event) => {
+			try {
+				console.log('📨 WebSocket message received on server:', event.data);
+				const message: WebSocketMessage = JSON.parse(event.data);
+				await this.handleWebSocketMessage(webSocket, message);
+			} catch (error) {
+				console.error('Error handling WebSocket message:', error);
+				this.sendError(webSocket, 'Invalid message format');
+			}
+		});
+
+		webSocket.addEventListener('close', (event) => {
+			console.log('🔌 WebSocket closed on server:', event.code, event.reason);
+			this.cleanupConnection(webSocket);
+		});
+
+		webSocket.addEventListener('error', (error) => {
+			console.log('❌ WebSocket error on server:', error);
+			this.cleanupConnection(webSocket);
+		});
+	}
+
+	private async handleWebSocketMessage(
+		webSocket: WebSocket,
+		message: WebSocketMessage,
+	): Promise<void> {
+		const { type, content, data, messageId, sessionId, supabaseSessionId } = message;
+
+
+		// Type assertion for enhanced message types
+		const messageType = type as WebSocketMessage['type'];
+
+		switch (messageType) {
+			case 'message':
+				if (content && sessionId) {
+					await this.handleUserMessage(webSocket, content, sessionId, messageId, supabaseSessionId);
+				}
+				break;
+
+			case 'interrupt':
+				this.handleInterrupt();
+				break;
+
+			case 'pause':
+				this.handlePause();
+				break;
+
+			case 'resume':
+				this.handleResume();
+				break;
+
+			case 'status':
+				this.sendStatus(webSocket, 'Connected to chat session');
+				break;
+
+			case 'set_preference':
+				if (data && sessionId) {
+					await this.handleSetUserPreference(sessionId, data);
+					this.sendMessage(webSocket, {
+						type: 'status',
+						content: 'Preference updated successfully',
+						messageId: messageId || '',
+					});
+				}
+				break;
+
+			case 'set_personality':
+				if (data && sessionId) {
+					await this.handleSetSessionPersonality(sessionId, data.personality);
+					this.sendMessage(webSocket, {
+						type: 'status',
+						content: 'AI personality updated for this session',
+						messageId: messageId || '',
+					});
+				}
+				break;
+
+			case 'set_user_context':
+				if (data && sessionId) {
+					await this.handleSetUserContext(sessionId, data);
+					this.sendMessage(webSocket, {
+						type: 'status',
+						content: 'User context updated successfully',
+						messageId: messageId || '',
+					});
+				}
+				break;
+
+			case 'get_context':
+				if (sessionId) {
+					const contextData = this.getSessionContextData(sessionId);
+					this.sendMessage(webSocket, {
+						type: 'context_data',
+						content: JSON.stringify(contextData),
+						data: contextData,
+						messageId: messageId || '',
+					});
+				}
+				break;
+
+			default:
+				console.warn('Unknown message type:', type);
+		}
+	}
+
+	private async handleUserMessage(
+		webSocket: WebSocket,
+		content: string,
+		sessionId: string,
+		messageId?: string,
+		supabaseSessionId?: string,
+	): Promise<void> {
+		try {
+			// Store user message
+			const userMessage: ChatMessage = {
+				id: messageId || this.generateId(),
+				role: 'user',
+				content,
+				timestamp: new Date(),
+			};
+
+			// Get or create session
+			let session = this.sessions.get(sessionId);
+			if (!session) {
+				// Use the supabaseSessionId passed from client, don't create a new one
+				session = {
+					id: sessionId,
+					supabaseSessionId: supabaseSessionId || '',
+					userId: this.currentUserId || 'websocket-user', // Use real user ID from URL params
+					workspaceId: this.workspaceId || 'default',
+					messages: [],
+					actions: [],
+					isActive: true,
+					createdAt: new Date(),
+					lastActivity: new Date(),
+				};
+				this.sessions.set(sessionId, session);
+
+				// Load action history from Supabase for context continuity (non-blocking)
+				if (this.supabaseEnabled && supabaseSessionId) {
+					this.loadActionHistoryFromSupabase(supabaseSessionId, session).catch((error) => {
+						console.warn('Failed to load action history, continuing without it:', error);
+					});
+				}
+			}
+
+			if (session) {
+				session.messages.push(userMessage);
+				session.lastActivity = new Date();
+
+				// Update conversation context with user message analysis
+				await this.updateConversationContext(sessionId, content);
+
+				// Send confirmation first
+				this.sendMessage(webSocket, {
+					type: 'status',
+					content: 'Message received, processing...',
+					messageId: userMessage.id,
+				});
+
+				// Note: User message saving is now handled by the WebSocket client
+				// before sending to avoid duplicate saves
+
+				// Start AI response
+				await this.generateAIResponse(webSocket, session, userMessage);
+			}
+		} catch (error) {
+			console.error('Error handling user message:', error);
+			this.sendError(webSocket, 'Failed to process message');
+		}
+	}
+
+	private async generateAIResponse(
+		webSocket: WebSocket,
+		session: IChatSession,
+		userMessage: ChatMessage,
+	): Promise<void> {
+		if (this.isStreaming) {
+			this.sendError(webSocket, 'AI is already responding');
+			return;
+		}
+
+		this.isStreaming = true;
+		this.currentStreamAbortController = new AbortController();
+
+		try {
+			// Create AI message
+			const aiMessage: ChatMessage = {
+				id: this.generateId(),
+				role: 'assistant',
+				content: '',
+				timestamp: new Date(),
+			};
+
+			session.messages.push(aiMessage);
+
+			// Send initial status
+			this.sendMessage(webSocket, {
+				type: 'status',
+				content: 'AI is thinking...',
+				messageId: aiMessage.id,
+			});
+
+			// Generate AI response with streaming
+			await this.streamAIResponse(webSocket, session, aiMessage, userMessage);
+		} catch (error) {
+			console.error('Error generating AI response:', error);
+			this.sendError(webSocket, 'Failed to generate AI response');
+		} finally {
+			this.isStreaming = false;
+			this.currentStreamAbortController = null;
+		}
+	}
+
+	private async getMCPCapabilities(): Promise<{
+		actions: any[];
+		resources: any[];
+		prompts: any[];
+	}> {
+		// Check global static cache first (shared across all sessions)
+		const now = Date.now();
+		if (ChatSession.globalMCPCapabilitiesCache && now < ChatSession.globalMCPCacheExpiry) {
+			console.log('🔄 Using global cached MCP capabilities');
+			return ChatSession.globalMCPCapabilitiesCache;
+		}
+
+		try {
+			const mcpServerUrl = this.env.MCP_SERVER_URL;
+			if (!mcpServerUrl) {
+				console.warn('⚠️ MCP_SERVER_URL not configured');
+				return { actions: [], resources: [], prompts: [] };
+			}
+
+			console.log('🔍 Discovering MCP capabilities (global cache expired):', mcpServerUrl);
+
+			// Step 1: Get available resources first
+			const resourcesResponse = await this.callMCPMethod('listResources', {});
+			
+
+			// Step 2: Get actions for each resource with proper filtering
+			let allActions: any[] = [];
+
+			for (const resource of resourcesResponse) {
+				if (resource.name) {
+					const resourceActions = await this.callMCPMethod('listActions', {
+						resource: resource.name,
+					});
+					allActions = allActions.concat(resourceActions);
+				}
+			}
+
+			// Convert MCP actions to OpenAI tool format with enhanced descriptions
+			const openaiActions = allActions.map((action: any) => {
+				const required = action.input_schema?.required || [];
+				const requiredStr =
+					required.length > 0 ? ` Required parameters: ${required.join(', ')}.` : '';
+
+				return {
+					type: 'function',
+					function: {
+						name: action.name,
+						description: `${action.description}${requiredStr} Always check the input_schema for required parameters before calling this function. You can learn the output from ${action.output_schema} `,
+						parameters: action.input_schema,
+					},
+				};
+			});
+
+			console.log('🛠️ Converted to OpenAI tools:', openaiActions.length, 'actions');
+
+			const capabilities = {
+				actions: openaiActions,
+				resources: resourcesResponse,
+				prompts: [],
+			};
+
+			// Cache globally (shared across all sessions) and persist to storage
+			ChatSession.globalMCPCapabilitiesCache = capabilities;
+			
+			// Use shorter TTL if storage is not available
+			const cacheTTL = this.storage ? this.MCP_CACHE_TTL : this.MCP_MEMORY_CACHE_TTL;
+			ChatSession.globalMCPCacheExpiry = now + cacheTTL;
+
+			// Persist to Cloudflare storage for future Durable Object instances (if available)
+			if (this.storage) {
+				await this.saveGlobalMCPCacheToStorage(capabilities, ChatSession.globalMCPCacheExpiry);
+				console.log('✅ MCP capabilities cached globally for 24 hours');
+			} else {
+				console.log('✅ MCP capabilities cached in memory for 10 minutes (storage not available)');
+			}
+			return capabilities;
+		} catch (error) {
+			console.error('❌ Error getting MCP capabilities:', error);
+			return { actions: [], resources: [], prompts: [] };
+		}
+	}
+
+	private async callMCPMethod(method: string, params: any): Promise<any[]> {
+		try {
+			const mcpServerUrl = this.env.MCP_SERVER_URL;
+			if (!mcpServerUrl) {
+				console.warn('⚠️ MCP server URL not configured');
+				return [];
+			}
+
+			const requestBody = {
+				jsonrpc: '2.0',
+				id: Date.now(),
+				method: method,
+				params: params,
+			};
+
+			// Small delay to avoid overwhelming the MCP server
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			const response = await fetch(mcpServerUrl, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify(requestBody),
+			});
+
+			if (!response.ok) {
+				const errorText = await response.text();
+				console.error(`❌ MCP ${method} HTTP error ${response.status}:`, errorText);
+				return [];
+			}
+
+			const jsonRpcResponse = await response.json();
+
+			if (jsonRpcResponse.error) {
+				console.error(`❌ MCP ${method} JSON-RPC error:`, jsonRpcResponse.error);
+				return [];
+			}
+
+			// Handle different response structures based on your MCP server's actual responses
+			if (method === 'listResources') {
+				// For listResources, return the resources array from result.resources
+				return jsonRpcResponse.result?.resources || [];
+			} else if (method === 'listActions') {
+				// For listActions with resource filter, the result IS the array of actions
+				// Example: {"jsonrpc": "2.0", "id": 3, "result": [{"name": "calendar_get_upcoming_events", ...}]}
+				if (Array.isArray(jsonRpcResponse.result)) {
+					return jsonRpcResponse.result;
+				}
+				// Fallback: some servers might return {actions: [...]}
+				return jsonRpcResponse.result?.actions || [];
+			}
+
+			// For other methods, return the result as-is or as array
+			if (Array.isArray(jsonRpcResponse.result)) {
+				return jsonRpcResponse.result;
+			}
+
+			return jsonRpcResponse.result ? [jsonRpcResponse.result] : [];
+		} catch (error) {
+			console.error(`❌ Error calling MCP ${method}:`, error);
+			return [];
+		}
+	}
+
+	private async executeMCPAction(
+		webSocket: WebSocket,
+		functionCall: any,
+		messageId: string,
+		sessionId: string,
+	): Promise<void> {
+		// Enhanced MCP execution with context awareness
+		await this.executeMCPActionWithContext(webSocket, functionCall, messageId, sessionId);
+	}
+
+	private async executeMCPActionWithContext(
+		webSocket: WebSocket,
+		functionCall: any,
+		messageId: string,
+		sessionId: string,
+	): Promise<void> {
+		try {
+			// Send status update: Starting MCP action
+			this.sendMCPStatusUpdate(
+				webSocket,
+				{
+					status: 'calling_tool',
+					action: functionCall.name,
+					details: `Executing ${functionCall.name}...`,
+				},
+				messageId,
+			);
+
+			// Check cache first for read operations
+			const cacheResult = await this.checkMCPCache(functionCall);
+			if (cacheResult) {
+				this.sendMCPStatusUpdate(
+					webSocket,
+					{
+						status: 'processing_results',
+						details: 'Using cached result',
+					},
+					messageId,
+				);
+
+				await this.processMCPResult(webSocket, cacheResult, functionCall, messageId, sessionId);
+				return;
+			}
+
+			// Validate function call
+			if (!functionCall.name) {
+				throw new Error('Function name is missing from tool call');
+			}
+
+			const mcpServerUrl = this.env.MCP_SERVER_URL;
+			if (!mcpServerUrl) {
+				throw new Error('MCP server URL not configured');
+			}
+
+			// Parse and enhance arguments with context
+			let args = this.parseAndEnhanceArguments(functionCall, sessionId);
+
+			// Add required workspace_id if not present
+			if (!args.workspace_id) {
+				args.workspace_id = this.workspaceId || 'default-workspace';
+			}
+
+			// Log the final arguments being sent to MCP
+			console.log('🔍 MCP Function Call Details:');
+			console.log('Function Name:', functionCall.name);
+			console.log('Original Arguments:', functionCall.arguments);
+			console.log('Enhanced Arguments:', JSON.stringify(args, null, 2));
+
+			// Send status update: Calling MCP server
+			this.sendMCPStatusUpdate(
+				webSocket,
+				{
+					status: 'calling_tool',
+					action: functionCall.name,
+					details: `Calling MCP server for ${functionCall.name}...`,
+				},
+				messageId,
+			);
+
+			const invokeRequestBody = {
+				jsonrpc: '2.0',
+				id: Date.now(),
+				method: 'invokeAction',
+				params: {
+					name: functionCall.name,
+					arguments: args,
+				},
+			};
+
+			// Execute MCP call with retry logic
+			const jsonRpcResponse = await this.executeMCPCallWithRetry(
+				mcpServerUrl,
+				invokeRequestBody,
+				webSocket,
+				messageId,
+			);
+			// Handle JSON-RPC response format
+			if (jsonRpcResponse.error) {
+				throw new Error(`MCP action error: ${jsonRpcResponse.error.message || 'Unknown error'}`);
+			}
+
+			const result = jsonRpcResponse.result;
+
+			// Process MCP result with enhanced context management
+			await this.processMCPResult(webSocket, result, functionCall, messageId, sessionId);
+		} catch (error) {
+			console.error('MCP action execution error:', error);
+
+			this.sendMessage(webSocket, {
+				type: 'error',
+				content: `MCP action error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+				messageId: messageId,
+			});
+		}
+	}
+
+	private extractActionMetadata(functionName: string, result: any): any | null {
+		try {
+			// Extract relevant IDs and metadata based on action type
+			if (!result) return null;
+
+			// Use ContextSummarizer to get compact context instead of full result
+			const contextSummary = ContextSummarizer.extractContext(functionName, result);
+
+			const metadata: any = {
+				functionName,
+				timestamp: new Date().toISOString(),
+				status: 'completed',
+				context: contextSummary,
+			};
+
+			// Add specific IDs for quick reference
+			if (contextSummary.primary_entity) {
+				metadata.primaryId = contextSummary.primary_entity.id;
+				metadata.primaryType = contextSummary.primary_entity.type;
+			}
+
+			// Add count information
+			metadata.totalCount = contextSummary.total_count;
+
+			return metadata;
+		} catch (error) {
+			console.error('Error extracting action metadata:', error);
+			return null;
+		}
+	}
+
+	private storeActionInSession(sessionId: string, actionMetadata: any): void {
+		try {
+			const session = this.sessions.get(sessionId);
+			if (!session) {
+				console.warn('Session not found for storing action metadata:', sessionId);
+				return;
+			}
+
+			// Initialize actions array if not exists
+			if (!session.actions) {
+				session.actions = [];
+			}
+
+			// Add the action metadata
+			session.actions.push(actionMetadata);
+
+			// Keep only the last 20 actions to avoid memory bloat
+			if (session.actions.length > 20) {
+				session.actions = session.actions.slice(-20);
+			}
+
+			console.log('✅ Stored action metadata in session:', actionMetadata.functionName);
+
+			// Save to Cloudflare storage (primary persistence)
+			this.persistSessionActionsToStorage(sessionId, session.actions).catch((error) => {
+				console.warn('Failed to persist actions to Cloudflare storage:', error);
+			});
+
+			// Save to Supabase for persistence (secondary/backup)
+			if (this.supabaseEnabled && session.supabaseSessionId) {
+				this.saveActionToSupabase(session.supabaseSessionId, actionMetadata).catch((error) => {
+					console.warn('Failed to save action to Supabase, continuing without persistence:', error);
+				});
+			}
+		} catch (error) {
+			console.error('Error storing action in session:', error);
+		}
+	}
+
+	/**
+	 * Clean up session actions to prevent metadata bloat
+	 */
+	private cleanupSessionActions(actions: any[]): any[] {
+		if (actions.length <= 50) {
+			return actions;
+		}
+
+		// Sort by timestamp (newest first) and keep only the most recent 50 actions
+		const sortedActions = actions
+			.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+			.slice(0, 50);
+
+		console.log(`🧹 Cleaned up session actions: kept ${sortedActions.length} out of ${actions.length} actions`);
+		return sortedActions;
+	}
+
+	private extractContactsFromMetadata(sessionMetadata: any): any[] {
+		const contacts: any[] = [];
+
+		// Extract contacts from actions metadata
+		if (sessionMetadata.actions && Array.isArray(sessionMetadata.actions)) {
+			for (const action of sessionMetadata.actions) {
+				if (action.result && action.result.contacts && Array.isArray(action.result.contacts)) {
+					// Add contacts from this action
+					contacts.push(...action.result.contacts);
+				}
+			}
+		}
+
+		// Remove duplicates based on email
+		const uniqueContacts = contacts.filter(
+			(contact, index, self) => index === self.findIndex((c) => c.email === contact.email),
+		);
+
+		return uniqueContacts;
+	}
+
+	private extractEmailsFromMetadata(sessionMetadata: any): any[] {
+		const emails: any[] = [];
+
+		// Extract emails from actions metadata
+		if (sessionMetadata.actions && Array.isArray(sessionMetadata.actions)) {
+			for (const action of sessionMetadata.actions) {
+				if (action.result && action.result.emails && Array.isArray(action.result.emails)) {
+					emails.push(...action.result.emails);
+				}
+			}
+		}
+
+		return emails;
+	}
+
+	private extractMeetingsFromMetadata(sessionMetadata: any): any[] {
+		const meetings: any[] = [];
+
+		// Extract meetings from actions metadata
+		if (sessionMetadata.actions && Array.isArray(sessionMetadata.actions)) {
+			for (const action of sessionMetadata.actions) {
+				if (action.result && action.result.meetings && Array.isArray(action.result.meetings)) {
+					meetings.push(...action.result.meetings);
+				}
+			}
+		}
+
+		return meetings;
+	}
+
+	private extractUserInfoFromSession(session: any): any {
+		const userInfo: any = {};
+
+		// Extract user information from session messages
+		if (session.messages && session.messages.length > 0) {
+			for (const message of session.messages) {
+				if (message.role === 'user' && message.content) {
+					// Extract name patterns like "Hi I'm John", "My name is John", "I'm John", etc.
+					const namePatterns = [
+						/^(?:hi|hello|hey)[\s,]*(?:i'?m|i am|my name is|call me)\s+([a-zA-Z]+)/i,
+						/^(?:i'?m|i am|my name is|call me)\s+([a-zA-Z]+)/i,
+						/^(?:this is|it's)\s+([a-zA-Z]+)/i,
+					];
+
+					for (const pattern of namePatterns) {
+						const match = message.content.match(pattern);
+						if (match && match[1]) {
+							userInfo.name = match[1];
+							break;
+						}
+					}
+
+					// Extract email patterns
+					const emailPattern = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
+					const emailMatch = message.content.match(emailPattern);
+					if (emailMatch && emailMatch[1]) {
+						userInfo.email = emailMatch[1];
+					}
+
+					// Extract company information
+					if (
+						message.content.toLowerCase().includes('my company is') ||
+						message.content.toLowerCase().includes('i work at')
+					) {
+						const companyMatch = message.content.match(/(?:my company is|i work at)\s+([^.!?]+)/i);
+						if (companyMatch && companyMatch[1]) {
+							userInfo.company = companyMatch[1].trim();
+						}
+					}
+
+					// If we found user info, break to avoid overwriting with later messages
+					if (userInfo.name || userInfo.email || userInfo.company) {
+						break;
+					}
+				}
+			}
+		}
+
+		return Object.keys(userInfo).length > 0 ? userInfo : null;
+	}
+
+	private buildMainConversationMessages(
+		session: any,
+		userMessage: any,
+		availableActions: any[],
+	): any[] {
+		const messages: any[] = [];
+
+		// Add system prompt with enhanced context
+		const sessionMetadata = session.supabaseMetadata || {};
+		const userInfo = sessionMetadata.user_info || {};
+		const workspaceContext = sessionMetadata.workspace_context || {};
+
+		// Extract contact information from actions metadata AND session entities
+		const availableContacts = this.extractContactsFromMetadata(sessionMetadata);
+		const entityContext = this.sessionEntities.get(session.id);
+		const allContacts = [...availableContacts];
+		
+		// Add contacts from session entity context
+		if (entityContext?.contacts) {
+			allContacts.push(...entityContext.contacts);
+		}
+		
+		// Remove duplicates based on email
+		const uniqueContacts = allContacts.filter((contact, index, arr) => 
+			arr.findIndex(c => c.email === contact.email) === index
+		);
+
+		const currentDate = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+		const currentDateTime = new Date().toISOString();
+		const currentYear = new Date().getFullYear();
+		
+		const systemPrompt = `You are Lineer, a joyful and smart AI assistant that helps users manage their emails, schedules, tasks, meetings, and contacts.
+        Users talk casually — your job is to translate their requests into exact MCP actions with all required parameters.
+
+		You can access the mcp for any actions related to their request (Company connection, contacts, Schedules, Meeting, Emails)
+
+		🕐 CRITICAL DATE & TIME AWARENESS:
+		- TODAY'S DATE: ${currentDate}
+		- CURRENT YEAR: ${currentYear}
+		- CURRENT DATETIME: ${currentDateTime}
+		- ALWAYS use the CURRENT year (${currentYear}) when creating dates
+		- When user says "tomorrow", use ${new Date(Date.now() + 24*60*60*1000).toISOString().split('T')[0]}
+		- When user says "next week", calculate from current date
+		- NEVER use dates from previous years (like 2023) - always use ${currentYear}
+		- For meeting times, use realistic current dates, not past dates
+
+		🧠 ENHANCED CONTEXT UNDERSTANDING:
+		- Pay close attention to conversation flow and user intent
+		- When user refers to "him", "her", "that", look at recent conversation context
+		- Remember what was just discussed and build upon it logically
+		- If user asks follow-up questions, they're usually about the most recent topic/action
+		- Don't repeat information unnecessarily - be contextually aware
+		- Understand implied requests (e.g., "tell me more about this" after scheduling a meeting)
+
+		✨ Personality & Style
+
+Be warm, helpful, and concise — like a friendly coworker.
+
+Understand casual input like "Tell Martin hi" or "Remind me tomorrow".
+
+If info is missing, ask once politely. Don't loop or repeat unnecessarily.
+Please do not be repetetive.
+
+CURRENT SESSION CONTEXT:
+- User ID: ${session.userId || 'websocket-user'}
+- Workspace ID: ${this.workspaceId || 'default-workspace'}
+- Session ID: ${session.id}
+- User Name: ${userInfo.name || 'Not specified'}
+- User Email: ${userInfo.email || 'Not specified'}
+
+🧑‍🤝‍🧑 AVAILABLE CONTACTS FOR PRONOUN RESOLUTION:
+${uniqueContacts.length > 0 ? 
+	uniqueContacts.slice(0, 10).map((contact, idx) => 
+		`${idx + 1}. ${contact.name || contact.title || 'Unknown'} - ${contact.email}${contact.metadata?.company ? ` (${contact.metadata.company})` : ''}`
+	).join('\n') 
+	: 'No contacts loaded yet - use contacts_get_all to load contacts first'}
+
+🔍 SMART PRONOUN RESOLUTION RULES:
+- When user says "him" → Look for the most recent male contact mentioned or assume the last contact if gender unclear
+- When user says "her" → Look for the most recent female contact mentioned or assume the last contact if gender unclear  
+- When user says "them" → Refer to the most recent group of contacts mentioned
+- When user says "that person" → Refer to the most recently mentioned contact
+- When user says "Lester" or "John" → Use John Lester (jlalmenanza10@gmail.com)
+- When user says "Martin" → Use Martin (twsringburubudur@gmail.com)
+- ALWAYS use the contact's actual email address from the list above, never make up emails
+
+📝 RECENT ENTITY CONTEXT:
+${entityContext ? `
+- Contacts in context: ${entityContext.contacts.length}
+- Emails in context: ${entityContext.emails.length}  
+- Meetings in context: ${entityContext.meetings.length}
+- Last updated: ${new Date(entityContext.lastUpdated).toLocaleString()}
+` : 'No entity context available'}
+- Company: ${userInfo.company || 'Not specified'}
+- Total Messages: ${sessionMetadata.total_messages || 0}
+- Actions Completed: ${sessionMetadata.actions_completed || 0}
+
+AVAILABLE CONTACTS:
+${
+	availableContacts.length > 0
+		? availableContacts
+				.map(
+					(contact) =>
+						`- ${contact.name} (${contact.email})${contact.company ? ` - ${contact.company}` : ''}`,
+				)
+				.join('\n')
+		: 'No contacts loaded yet'
+}
+
+CRITICAL MCP USAGE GUIDELINES:
+
+1. **ALWAYS CHECK REQUIRED PARAMETERS**: Before calling any MCP function, you MUST examine the input_schema to understand:
+   - What parameters are required (marked as "required" in the schema)
+   - What parameters are optional
+   - The expected data types and formats
+   - Any validation rules or constraints
+
+2. **PARAMETER VALIDATION**: You must provide ALL required parameters. If you don't have a required parameter, you should:
+   - Ask the user for the missing information
+   - Use reasonable defaults when appropriate
+   - Never call a function without required parameters
+
+3. **SCHEMA AWARENESS**: Each MCP function has detailed schemas showing:
+   - Input parameters and their types
+   - Required vs optional fields
+   - Expected output format
+   - Validation rules (email format, date-time format, etc.)
+
+4. **SMART PARAMETER EXTRACTION**: When users make requests, extract the necessary parameters:
+   - For emails: extract recipient emails, subject, body content
+   - For meetings: extract title, start_time, end_time, attendee_emails, attendee_names, description, location, meeting_link
+   - For meeting queries: extract status (upcoming, past, draft, sent, all), limit, offset
+   - For contacts: extract name, email, phone, company
+   - For tasks: extract title, description, due date, priority
+   - For schedule queries: use meeting_list_meetings with status: "upcoming" (replaces old calendar functions)
+
+5. **EMAIL FUNCTION SPECIFIC GUIDELINES**:
+   - For email_draft_email: ALWAYS include "subject" and "body" parameters
+   - Extract the actual message content from user's request
+   - If user says "say HI this is a test", set body: "HI this is a test"
+   - If user mentions a recipient name, use their emails in to_emails 
+   - NEVER leave subject or body empty - always extract from user's message
+   - For to_emails, always use a valid email address from the context. If you are not sure of the email, ask the user to provide it.
+   - CRITICAL: When user says "draft him a message" or "send him a message", use email_draft_email, NOT contacts_search
+   - CRITICAL: If you already found a contact in previous messages, use that contact's email directly
+
+6. **REQUIRED CONTEXT PARAMETERS**: Always include these in your function calls:
+   - workspace_id: "${this.workspaceId}"
+   - user_id: "${session.userId}"
+
+7. **CONTACT RESOLUTION**: When users mention people by name:
+   - ALWAYS check the AVAILABLE CONTACTS list above first
+   - Use the exact email address from the contacts list (e.g., if user says "Lester", use "jlalmenanza10@gmail.com")
+   - If the name matches a contact in the list, use that contact's email address
+   - If a name can't be found in the contacts list, ask the user for the email address
+   - The email addresses must be accurate and come from the available contacts 
+8. **EXAMPLE WORKFLOW**:
+   User: "Hey draft Martin an email saying HI there what is up"
+   Your process:
+   - Identify this needs email_draft_email function
+   - Check AVAILABLE CONTACTS list: find "Martin" with email "twsringburubudur@gmail.com"
+   - Use the exact email from the contacts list
+   - Check required parameters: workspace_id, user_id, to_emails, subject, body
+   - Extract: to_emails=["twsringburubudur@gmail.com"], subject="Hi there", body="HI there what is up"
+   - Include: workspace_id="${this.workspaceId}", user_id="${session.userId}"
+   - Call the function with ALL required parameters filled
+
+9. **MULTI-TURN CONVERSATION EXAMPLE**:
+   Previous: User asked "Can you check my contacts please. I'm looking for lester" → AI found John Lester
+   Current: User says "Draft him a message say hi"
+   Your process:
+   - Understand "him" refers to John Lester from previous context
+   - Use email_draft_email function (NOT contacts_search again)
+   - Extract: to_emails=["jlalmenanza10@gmail.com"], subject="Hi", body="hi"
+   - Include: workspace_id="${this.workspaceId}", user_id="${session.userId}"
+   - Call email_draft_email with these parameters
+
+10. **EMAIL DRAFTING EXAMPLE**:
+   User: "say HI this is a test from lineer chat"
+   Your process:
+   - Identify this needs email_draft_email function
+   - Extract: subject="Test Message", body="HI this is a test from lineer chat"
+   - Include: workspace_id="${this.workspaceId}", user_id="${session.userId}"
+   - Ask user for recipient or use a default if appropriate
+   - Call function with: {"workspace_id": "...", "user_id": "...", "subject": "Test Message", "body": "HI this is a test from lineer chat", "to_emails": ["email"]}
+
+11. **EMAIL SENDING EXAMPLE**:
+   User: "send it" (after a draft was created)
+   Your process:
+   - Identify this needs email_send_email function
+   - Use the email_id from the previous draft result
+   - Include: workspace_id="${this.workspaceId}", user_id="${session.userId}"
+   - Call function with: {"email_id": "draft_id_from_previous_result", "workspace_id": "...", "user_id": "..."}
+
+12. **SCHEDULE CHECKING EXAMPLE**:
+   User: "What's my schedule for tomorrow?"
+   Your process:
+   - Identify this needs meeting_list_meetings function
+   - Extract: status="upcoming" (to get future events)
+   - Include: workspace_id="${this.workspaceId}", user_id="${session.userId}"
+   - Call function with: {"workspace_id": "...", "user_id": "...", "status": "upcoming"}
+
+13. **MEETING CREATION EXAMPLE**:
+   User: "Schedule a meeting with John tomorrow at 2pm"
+   Your process:
+   - Identify this needs meeting_draft_meeting function
+   - Extract: title, start_time, end_time, attendee_emails, attendee_names
+   - Include: workspace_id="${this.workspaceId}", user_id="${session.userId}"
+   - Call function with: {"workspace_id": "...", "user_id": "...", "title": "Meeting with John", "start_time": "2024-01-15T14:00:00Z", "end_time": "2024-01-15T15:00:00Z", "attendee_emails": ["john@email.com"], "attendee_names": ["John"]}
+
+14. **MEETING UPDATE EXAMPLE**:
+   User: "I need to reschedule my 2pm meeting to 3pm"
+   Your process:
+   - First call meeting_list_meetings to find the 2pm meeting
+   - Then use meeting_update_draft with new time
+   - Include: workspace_id="${this.workspaceId}", user_id="${session.userId}"
+   - Extract meeting_id and new time parameters
+
+15. **MEETING UPDATE WITH CONTEXT EXAMPLE**:
+   User: "Maybe update that. For September 20. Titled testing demo app"
+   Your process:
+   - User is referring to a previously mentioned meeting
+   - Use meeting_update_draft with the meeting_id from previous context
+   - Extract: title="testing demo app", date="September 20"
+   - Include: workspace_id="${this.workspaceId}", user_id="${session.userId}"
+   - Call function with: {"meeting_id": "from_previous_context", "title": "testing demo app", "workspace_id": "...", "user_id": "..."}
+
+Available MCP Actions:
+${availableActions
+	.map((action) => {
+		const required = action.function.parameters?.required || [];
+		const requiredStr = required.length > 0 ? ` (Required: ${required.join(', ')})` : '';
+		return `- ${action.function.name}: ${action.function.description}${requiredStr}`;
+	})
+	.join('\n')}
+
+When users ask for data or actions, you should automatically call the appropriate MCP action using the available tools. Don't just describe what you would do - actually do it by calling the appropriate functions.
+
+Be proactive and call the MCP server immediately when relevant. Use the exact action names as they appear in the list above.
+
+CRITICAL FUNCTION SELECTION RULES:
+- If user says "draft", "create message", "write email" → Use email_draft_email
+- If user says "send", "send message", "send email" → Use email_send_email (requires email_id from previous draft)
+- If user says "check contacts", "find contact", "search for" → Use contacts_search  
+- If user already found a contact and now wants to "draft him a message" → Use email_draft_email (NOT contacts_search again)
+- If user refers to "him", "her", "that person" from previous context → Use email_draft_email with the previously found contact's email
+- NEVER call contacts_search multiple times in a row unless user explicitly asks to search again
+- NEVER call email_draft_email multiple times for the same message
+
+**CONTACT CONTEXT AWARENESS:**
+- ALWAYS check the Recent Actions Context for previously found contacts
+- When user says "draft meeting with him" or "send email to her", look for the most recent contact in the context
+- Use the contact's email from the context, don't search again
+- If multiple contacts were found, ask the user to clarify which one: "I found John Lester and Martin. Which one did you mean?"
+- NEVER search for contacts again if you already have them in context
+- CRITICAL: If you just found a contact in the previous action, use that contact's email directly
+- DO NOT call contacts_search again if you already have the contact from recent actions
+
+**CONTACT CONTEXT EXAMPLE:**
+Recent Actions Context shows:
+1. contacts_search - Found 6 entities:
+   * John Lester (contact): jlalmenanza10@gmail.com | at Adaca
+   * Martin (contact): twsringburubudur@gmail.com
+   * Google (contact): no-reply@accounts.google.com | at Accounts Google
+
+User says: "draft meeting with him"
+AI should: Use John Lester's email (jlalmenanza10@gmail.com) from the context, NOT search again
+AI should NOT: Call contacts_search again
+
+**CRITICAL PRONOUN RESOLUTION RULES:**
+- "him" = most recent male contact from previous actions
+- "her" = most recent female contact from previous actions  
+- "them" = most recent group of contacts from previous actions
+- "that person" = most recently mentioned contact from previous actions
+- ALWAYS use the email from the RECENTLY FOUND CONTACTS list above
+- NEVER search for contacts again if you already have them in context
+
+MEETING & CALENDAR FUNCTION RULES (UPDATED):
+**IMPORTANT: Meetings = Calendar Events - They are the same thing. Use meeting actions for ALL calendar and meeting management.**
+
+**SMART MEETING CREATION WORKFLOW:**
+1. **ALWAYS CHECK AVAILABILITY FIRST** - Before creating any meeting, check the user's schedule
+2. **ASK FOR MISSING DETAILS** - Don't create meetings with incomplete information
+3. **SUGGEST OPTIMAL TIMES** - Based on their schedule, suggest the best available times
+
+**FUNCTION SELECTION RULES:**
+- If user says "check my schedule", "what's my schedule", "show my calendar", "my meetings", "upcoming events" → Use meeting_list_meetings with status: "upcoming"
+- If user says "create meeting", "book meeting", "schedule meeting", "add to calendar" → **FIRST** check availability with meeting_list_meetings, **THEN** ask for missing details before using meeting_draft_meeting
+- If user says "schedule meeting with him/her/them" → Use meeting_draft_meeting with the contact email from RECENTLY FOUND CONTACTS, NOT contacts_search
+- If user says "update", "change", "modify", "edit" + meeting details → Use meeting_update_draft (NEVER use meeting_list_meetings for updates)
+- If user says "adjust my schedule", "reschedule", "move meeting", "change time" → First check current events with meeting_list_meetings, then use meeting_update_draft
+- If user says "cancel meeting", "delete meeting", "remove from calendar" → Use meeting_cancel_meeting
+- If user says "list meetings", "show meetings", "my meetings today/this week" → Use meeting_list_meetings
+- If user says "send invites", "invite people", "add attendees" → Use meeting_send_invite or meeting_invite_to_existing
+
+**MEETING CREATION BEST PRACTICES:**
+- **NEVER create a meeting without checking availability first**
+- **ALWAYS ask for missing details**: title, time, attendees, location
+- **SUGGEST specific times** based on their schedule
+- **CONFIRM details** before creating the meeting
+- **EXPLAIN what you're doing**: "Let me check your availability for Friday..."
+
+**CRITICAL PARAMETERS:**
+- Always include workspace_id and user_id in ALL meeting function calls
+- Use ISO string format for start_time and end_time (e.g., "2024-01-15T10:00:00Z")
+- For attendee_emails and attendee_names arrays, ensure they have the same length
+- When user says "update that" or "change that" referring to a previous meeting, use meeting_update_draft with the meeting_id from previous context
+- Always check the conversation context for recent meeting IDs when user refers to "that meeting" or "the meeting"
+- If user mentions updating a meeting without specifying which one, use the most recent meeting_id from the session actions
+
+MEETING ACTION DECISION TREE:
+**Need to see events?** → meeting_list_meetings with status: "upcoming"
+**Need to create event?** → meeting_draft_meeting 
+**Need to update event?** → meeting_update_draft
+**Need to cancel event?** → meeting_cancel_meeting
+**Need to send invites?** → meeting_send_invite
+**Need to add people?** → meeting_invite_to_existing
+
+MEETING WORKFLOW EXAMPLES:
+
+**SMART MEETING CREATION EXAMPLE:**
+User: "Create me a meeting on Friday"
+AI Response: "I'd be happy to help you create a meeting for Friday! Let me first check your availability for that day to suggest the best times."
+AI Action: meeting_list_meetings with status: "upcoming" and date filter for Friday
+AI Follow-up: "I can see you have [X meetings] on Friday. What time would work best for you? Also, what should we call this meeting and who should attend?"
+
+1. **Create and Send Meeting**:
+   - Check availability: meeting_list_meetings
+   - Ask for details: title, time, attendees
+   - Draft: meeting_draft_meeting
+   - Send: meeting_send_invite
+
+2. **Update Existing Meeting**:
+   - Update: meeting_update_draft
+   - Resend: meeting_send_invite (if needed)
+
+3. **Get Upcoming Events**:
+   - meeting_list_meetings with status: "upcoming"
+
+4. **Add People to Existing Meeting**:
+   - meeting_invite_to_existing`;
+
+		messages.push({
+			role: 'system',
+			content: systemPrompt,
+		});
+
+		// Add conversation history (last 20 messages = 10 user + 10 AI)
+		if (session.messages && session.messages.length > 0) {
+			const recentMessages = session.messages.slice(-20);
+			recentMessages.forEach((msg: any) => {
+				messages.push({
+					role: msg.role === 'user' ? 'user' : 'assistant',
+					content: msg.content,
+				});
+			});
+		}
+
+		// Add conversation context summary for better context understanding
+		const conversationContext = this.buildConversationContextSummary(session);
+		if (conversationContext) {
+			messages.push({
+				role: 'system',
+				content: `CONVERSATION CONTEXT SUMMARY:\n${conversationContext}\n\nUse this context to understand references like "him", "her", "that person", etc. from previous messages.`,
+			});
+		}
+
+		// Add the current user message
+		messages.push({
+			role: 'user',
+			content: userMessage.content,
+		});
+
+		return messages;
+	}
+
+	private trackEmailDraft(sessionId: string, emailId: string): void {
+		this.emailDrafts.set(sessionId, emailId);
+		
+	}
+
+	private getEmailDraftId(sessionId: string): string | null {
+		const emailId = this.emailDrafts.get(sessionId);
+		
+		return emailId || null;
+	}
+
+	private buildConversationContextSummary(session: any): string {
+		const contextItems: string[] = [];
+
+		// Get entities from session metadata (this is where MCP actions store their results)
+		const sessionMetadata = session.supabaseMetadata || {};
+		
+		// Extract contacts from metadata
+		const contacts = this.extractContactsFromMetadata(sessionMetadata);
+		if (contacts.length > 0) {
+			const contactList = contacts.slice(0, 10).map(contact => 
+				`${contact.name} (${contact.email})${contact.company ? ` - ${contact.company}` : ''}`
+			).join(', ');
+			contextItems.push(`🧑‍🤝‍🧑 RECENTLY FOUND CONTACTS (use these for pronoun resolution): ${contactList}`);
+		}
+
+		// Extract emails from metadata
+		const emails = this.extractEmailsFromMetadata(sessionMetadata);
+		if (emails.length > 0) {
+			const emailList = emails.slice(0, 5).map(email => 
+				`${email.subject} (${email.status})`
+			).join(', ');
+			contextItems.push(`📧 Recent emails: ${emailList}`);
+		}
+
+		// Extract meetings from metadata
+		const meetings = this.extractMeetingsFromMetadata(sessionMetadata);
+		if (meetings.length > 0) {
+			const meetingList = meetings.slice(0, 5).map(meeting => 
+				`${meeting.title} (${meeting.status})`
+			).join(', ');
+			contextItems.push(`📅 Recent meetings: ${meetingList}`);
+		}
+
+		// Add entity-based contact context for better pronoun resolution
+		const entityContext = this.sessionEntities.get(session.id);
+		if (entityContext && entityContext.contacts.length > 0) {
+			const recentEntityContacts = entityContext.contacts.slice(-5).map(contact => 
+				`${contact.name} (${contact.email})`
+			).join(', ');
+			contextItems.push(`📇 Recent contacts from actions: ${recentEntityContacts}`);
+		}
+
+		// Extract recent actions from metadata
+		if (sessionMetadata.actions && Array.isArray(sessionMetadata.actions)) {
+			const recentActions = sessionMetadata.actions.slice(-5).map((action: any) => {
+				return `${action.function_name || action.type || 'Action'}: ${action.result?.summary || 'Completed'}`;
+			});
+			
+			if (recentActions.length > 0) {
+				contextItems.push(`📋 Recent actions: ${recentActions.join(', ')}`);
+			}
+		}
+
+		// Check if there's a tracked email draft for this session
+		const emailDraftId = this.getEmailDraftId(session.id);
+		if (emailDraftId) {
+			contextItems.push(`Email draft available: ${emailDraftId} (ready to send)`);
+		}
+
+		// Check for recent meeting context
+		const recentMeetingContext = this.extractRecentMeetingContext(session);
+		if (recentMeetingContext) {
+			contextItems.push(`Recent meeting context: ${recentMeetingContext}`);
+		}
+
+		return contextItems.join('\n');
+	}
+
+
+
+
+	private async retryOpenAICall(
+		apiCall: () => Promise<Response>,
+		maxRetries: number = 3,
+		baseDelayMs: number = 1000
+	): Promise<Response> {
+		let lastError: Error;
+
+		for (let attempt = 1; attempt <= maxRetries; attempt++) {
+			try {
+				console.log(`🔄 OpenAI API attempt ${attempt}/${maxRetries}`);
+				
+				const response = await apiCall();
+				
+				if (!response.ok) {
+					const errorMsg = `OpenAI API error: ${response.status} ${response.statusText}`;
+					console.error(`❌ Attempt ${attempt} failed:`, errorMsg);
+					
+					// Log additional details for 403 errors
+					if (response.status === 403) {
+						console.error(`🔑 403 Forbidden - Check OpenAI API key validity and billing status`);
+						try {
+							const errorBody = await response.text();
+							console.error(`🔍 Error details:`, errorBody);
+						} catch (e) {
+							console.error(`🔍 Could not read error body:`, e);
+						}
+					}
+					
+					// If it's a retryable error and we have attempts left
+					if ((response.status === 403 || response.status === 429 || response.status >= 500) && attempt < maxRetries) {
+						const backoffMs = Math.pow(2, attempt) * baseDelayMs; // Exponential backoff
+						console.log(`⏳ Waiting ${backoffMs}ms before retry...`);
+						await new Promise(resolve => setTimeout(resolve, backoffMs));
+						lastError = new Error(errorMsg);
+						continue;
+					}
+					
+					throw new Error(errorMsg);
+				}
+
+				console.log(`✅ OpenAI API call successful on attempt ${attempt}`);
+				return response;
+				
+			} catch (error) {
+				console.error(`❌ Attempt ${attempt} failed with error:`, error);
+				lastError = error as Error;
+				
+				// If it's the last attempt, throw the error
+				if (attempt === maxRetries) {
+					throw lastError;
+				}
+				
+				// Wait before retry (with exponential backoff)
+				const backoffMs = Math.pow(2, attempt) * baseDelayMs;
+				console.log(`⏳ Waiting ${backoffMs}ms before retry...`);
+				await new Promise(resolve => setTimeout(resolve, backoffMs));
+			}
+		}
+
+		throw lastError!;
+	}
+
+	private extractRecentMeetingContext(session: any): string | null {
+		if (!session.actions || session.actions.length === 0) {
+			return null;
+		}
+
+		// Look for recent meeting actions
+		const recentMeetingActions = session.actions
+			.filter((action: any) => action.functionName && action.functionName.includes('meeting'))
+			.slice(-3); // Last 3 meeting actions
+
+		if (recentMeetingActions.length === 0) {
+			return null;
+		}
+
+		const contextItems: string[] = [];
+		recentMeetingActions.forEach((action: any) => {
+			if (action.meetingId) {
+				contextItems.push(`Meeting ID: ${action.meetingId}`);
+			}
+			if (action.result && action.result.title) {
+				contextItems.push(`Title: ${action.result.title}`);
+			}
+			if (action.result && action.result.start_time) {
+				contextItems.push(`Date: ${action.result.start_time}`);
+			}
+		});
+
+		return contextItems.length > 0 ? contextItems.join(', ') : null;
+	}
+
+	private buildConversationContext(
+		session: any,
+		functionResultMessage: any,
+		functionName: string,
+		actionMetadata?: any,
+	): any[] {
+		const messages = [];
+
+		// Get user preferences and conversation context
+		const userPrefs = this.userPreferences.get(session.userId) || this.getDefaultUserPreferences();
+		const convContext =
+			this.conversationContext.get(session.id) || this.getDefaultConversationContext();
+		const sessionPersonality = this.sessionPersonalities.get(session.id);
+
+		// Dynamic system prompt with user context
+		let systemPrompt = this.buildPersonalizedSystemPrompt(
+			userPrefs,
+			convContext,
+			sessionPersonality,
+		);
+
+		systemPrompt += `
+
+You have access to various tools and can perform actions like managing contacts, emails, tasks, and calendar events.
+
+IMPORTANT RESPONSE GUIDELINES:
+1. NEVER show raw IDs, technical data, or JSON responses to users
+2. ALWAYS craft human-friendly, conversational responses that summarize what was accomplished
+3. When presenting data, format it in a readable way (e.g., "I found 3 contacts: John Doe (john@email.com), Jane Smith (jane@email.com)")
+4. For actions that create/modify resources, confirm success in natural language (e.g., "I've created your meeting for tomorrow at 2 PM")
+5. When you perform actions that create or modify resources, you receive action metadata with IDs and status information. Use these IDs for subsequent operations instead of creating new resources.
+6. Always provide context and next steps when appropriate
+
+RESPONSE EXAMPLES:
+- Instead of: "Contact created with ID: 12345"
+- Say: "I've added John Doe to your contacts with email john@example.com"
+
+- Instead of: "Found 2 contacts: [{'id': '123', 'name': 'John'}, {'id': '456', 'name': 'Jane'}]"
+- Say: "I found 2 contacts in your list: John Doe and Jane Smith"
+
+- Instead of: "Meeting created: {'id': '789', 'title': 'Team Sync', 'start': '2024-01-15T14:00:00Z'}"
+- Say: "I've scheduled your 'Team Sync' meeting for Monday, January 15th at 2:00 PM"
+
+ENHANCED DATA PROCESSING:
+When you receive function results, look for these special fields that help you craft better responses:
+- _userFriendlyHints: Contains suggestedResponse and keyData to guide your response
+- _actionType: Indicates if this was a create/read/update/delete operation
+- _formattedData: Contains user-friendly formatted data (dates, names, etc.)
+
+Use the suggestedResponse as a starting point and expand it with the keyData to create natural, helpful responses.`;
+
+		// Add action history context if available
+		if (session.actions && session.actions.length > 0) {
+			systemPrompt += `\n\nRecent Actions Context:\n`;
+			session.actions.slice(-10).forEach((action: any, index: number) => {
+				systemPrompt += `${index + 1}. ${action.functionName} (${action.timestamp})\n`;
+				if (action.emailId) systemPrompt += `   - Email ID: ${action.emailId}\n`;
+				if (action.contactId) systemPrompt += `   - Contact ID: ${action.contactId}\n`;
+				if (action.contactIds)
+					systemPrompt += `   - Contact IDs: ${action.contactIds.join(', ')}\n`;
+				if (action.taskId) systemPrompt += `   - Task ID: ${action.taskId}\n`;
+				if (action.meetingId) systemPrompt += `   - Meeting ID: ${action.meetingId}\n`;
+				if (action.status) systemPrompt += `   - Status: ${action.status}\n`;
+				
+				// Add detailed context from the action
+				if (action.context && action.context.entities_list) {
+					systemPrompt += `   - Found ${action.context.total_count} entities:\n`;
+					action.context.entities_list.slice(0, 3).forEach((entity: any) => {
+						systemPrompt += `     * ${entity.title} (${entity.type}): ${entity.summary}\n`;
+					});
+					if (action.context.entities_list.length > 3) {
+						systemPrompt += `     * ... and ${action.context.entities_list.length - 3} more\n`;
+					}
+				}
+			});
+		}
+
+		// Add current action context
+		if (actionMetadata) {
+			systemPrompt += `\n\nCurrent Action Result:\n`;
+			systemPrompt += `- Function: ${actionMetadata.functionName}\n`;
+			if (actionMetadata.emailId) systemPrompt += `- Email ID: ${actionMetadata.emailId}\n`;
+			if (actionMetadata.contactId) systemPrompt += `- Contact ID: ${actionMetadata.contactId}\n`;
+			if (actionMetadata.contactIds)
+				systemPrompt += `- Contact IDs: ${actionMetadata.contactIds.join(', ')}\n`;
+			if (actionMetadata.taskId) systemPrompt += `- Task ID: ${actionMetadata.taskId}\n`;
+			if (actionMetadata.meetingId) systemPrompt += `- Meeting ID: ${actionMetadata.meetingId}\n`;
+			if (actionMetadata.status) systemPrompt += `- Status: ${actionMetadata.status}\n`;
+		}
+
+		messages.push({
+			role: 'system',
+			content: systemPrompt,
+		});
+
+		// Add recent conversation history (last 20 messages = 10 user + 10 AI)
+		if (session.messages && session.messages.length > 0) {
+			const recentMessages = session.messages.slice(-20);
+			recentMessages.forEach((msg: any) => {
+				messages.push({
+					role: msg.role === 'user' ? 'user' : 'assistant',
+					content: msg.content,
+				});
+			});
+		}
+
+		// Add the function result
+		messages.push(functionResultMessage);
+
+		console.log(
+			'🏗️ Built conversation context with',
+			messages.length,
+			'messages and',
+			session.actions?.length || 0,
+			'actions',
+		);
+
+		return messages;
+	}
+
+	private async saveActionToSupabase(sessionId: string, actionMetadata: any): Promise<void> {
+		// Batch actions for better performance
+		this.addToMessageBuffer(sessionId, actionMetadata);
+	}
+
+	private addToMessageBuffer(sessionId: string, data: any): void {
+		if (!this.messageBuffer.has(sessionId)) {
+			this.messageBuffer.set(sessionId, []);
+		}
+
+		this.messageBuffer.get(sessionId)!.push(data);
+
+		// Clear existing timeout
+		if (this.batchSaveTimeout.has(sessionId)) {
+			clearTimeout(this.batchSaveTimeout.get(sessionId)!);
+		}
+
+		// Set new timeout for batch save
+		const timeout = setTimeout(() => {
+			this.flushMessageBuffer(sessionId);
+		}, this.BATCH_SAVE_DELAY);
+
+		this.batchSaveTimeout.set(sessionId, timeout);
+	}
+
+	private async flushMessageBuffer(sessionId: string): Promise<void> {
+		const buffer = this.messageBuffer.get(sessionId);
+		if (!buffer || buffer.length === 0) return;
+
+		try {
+			if (!this.env || !this.env.SUPABASE_URL || !this.env.SUPABASE_SERVICE_ROLE_KEY) {
+				return;
+			}
+
+			const supabaseUrl = this.env.SUPABASE_URL;
+			const supabaseServiceKey = this.env.SUPABASE_SERVICE_ROLE_KEY;
+
+			// Get session from sessions map
+			const session = this.sessions.get(sessionId);
+
+		// Process buffer through context summarizer to create compact metadata
+		const compactActions = buffer.map(action => {
+			if (action.context) {
+				// Already processed by extractActionMetadata
+				return action;
+			}
+			// Process through context summarizer for older actions
+			const contextSummary = ContextSummarizer.extractContext(action.functionName, action.result);
+			return {
+				...action,
+				context: contextSummary,
+				// Remove the full result to save space
+				result: undefined,
+			};
+		});
+
+		// Clean up context to prevent bloat (keep only last 50 actions)
+		const cleanedActions = this.cleanupSessionActions(compactActions);
+
+			// Batch update session metadata with compact context
+			const updateResponse = await fetch(
+				`${supabaseUrl}/rest/v1/chat_sessions?id=eq.${sessionId}`,
+				{
+					method: 'PATCH',
+					headers: {
+						Authorization: `Bearer ${supabaseServiceKey}`,
+						'Content-Type': 'application/json',
+						apikey: supabaseServiceKey,
+					},
+					body: JSON.stringify({
+						metadata: {
+							actions: cleanedActions,
+							last_batch_update: new Date().toISOString(),
+							// Include user information extracted from messages
+							user_info: session ? this.extractUserInfoFromSession(session) : null,
+							// Include workspace context
+							workspace_context: {
+								workspace_id: this.workspaceId,
+								user_id: session?.userId || this.currentUserId,
+								total_contacts: this.sessionEntities.get(sessionId)?.contacts?.length || 0,
+							},
+						},
+						updated_at: new Date().toISOString(),
+					}),
+				},
+			);
+
+			if (updateResponse.ok) {
+				console.log(`✅ Batch saved ${buffer.length} actions for session:`, sessionId);
+				
+				// Reload session actions from storage to get updated actions
+				const updatedActions = await this.loadSessionActionsFromStorage(sessionId);
+				if (session && updatedActions.length > 0) {
+					session.actions = updatedActions;
+				}
+			}
+		} catch (error) {
+			console.error('Error flushing message buffer:', error);
+		} finally {
+			// Clear buffer and timeout
+			this.messageBuffer.delete(sessionId);
+			this.batchSaveTimeout.delete(sessionId);
+		}
+	}
+
+	private async saveMessageToSupabase(sessionId: string, message: any): Promise<void> {
+		try {
+			// Check if environment variables are available
+			if (!this.env || !this.env.SUPABASE_URL || !this.env.SUPABASE_SERVICE_ROLE_KEY) {
+				console.warn('Supabase environment variables not available, cannot save message');
+				return;
+			}
+
+			const supabaseUrl = this.env.SUPABASE_URL;
+			const supabaseServiceKey = this.env.SUPABASE_SERVICE_ROLE_KEY;
+
+			// Save message to Supabase
+			const saveResponse = await fetch(`${supabaseUrl}/rest/v1/chat_messages`, {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${supabaseServiceKey}`,
+					'Content-Type': 'application/json',
+					apikey: supabaseServiceKey,
+					Prefer: 'return=minimal',
+				},
+				body: JSON.stringify({
+					session_id: sessionId,
+					text: message.text,
+					user_id: message.user_id,
+					workspace_id: message.workspace_id,
+					mode: message.mode,
+					is_own_message: message.is_own_message,
+					sender_name: message.sender_name,
+					actions: message.actions || [],
+				}),
+			});
+
+			if (!saveResponse.ok) {
+				const errorText = await saveResponse.text();
+				console.error('Failed to save message to Supabase:', saveResponse.status, errorText);
+				return;
+			}
+
+			const messageData = await saveResponse.json();
+			console.log('✅ Saved message to Supabase:', messageData[0]?.id);
+
+			// Update session timestamp
+			await fetch(`${supabaseUrl}/rest/v1/chat_sessions?id=eq.${sessionId}`, {
+				method: 'PATCH',
+				headers: {
+					Authorization: `Bearer ${supabaseServiceKey}`,
+					'Content-Type': 'application/json',
+					apikey: supabaseServiceKey,
+				},
+				body: JSON.stringify({
+					updated_at: new Date().toISOString(),
+				}),
+			});
+		} catch (error) {
+			console.error('Error saving message to Supabase:', error);
+		}
+	}
+
+	private async createSupabaseSession(sessionId?: string): Promise<string | null> {
+		try {
+			// Check if environment variables are available
+			if (!this.env || !this.env.SUPABASE_URL || !this.env.SUPABASE_SERVICE_ROLE_KEY) {
+				console.warn('Supabase environment variables not available, cannot create session');
+				return null;
+			}
+
+			const supabaseUrl = this.env.SUPABASE_URL;
+			const supabaseServiceKey = this.env.SUPABASE_SERVICE_ROLE_KEY;
+
+			// Get user info from session if available
+			let userId = 'websocket-user';
+			let workspaceId = this.workspaceId || 'default-workspace';
+
+			if (sessionId) {
+				const session = this.sessions.get(sessionId);
+				if (session) {
+					userId = session.userId || userId;
+					workspaceId = session.workspaceId || workspaceId;
+				}
+			}
+
+			console.log(
+				`🔍 Creating Supabase session with user_id: ${userId}, workspace_id: ${workspaceId}`,
+			);
+
+			// Create a new chat session in Supabase
+			const createResponse = await fetch(`${supabaseUrl}/rest/v1/chat_sessions`, {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${supabaseServiceKey}`,
+					'Content-Type': 'application/json',
+					apikey: supabaseServiceKey,
+				},
+				body: JSON.stringify({
+					user_id: userId,
+					workspace_id: workspaceId,
+					mode: 'text',
+					metadata: {
+						total_messages: 0,
+						voice_messages: 0,
+						actions_completed: 0,
+						created_via: 'websocket',
+					},
+				}),
+			});
+
+			if (!createResponse.ok) {
+				console.error('Failed to create Supabase session:', createResponse.status);
+				return null;
+			}
+
+			const sessionData = await createResponse.json();
+			console.log('✅ Created Supabase session:', sessionData[0]?.id);
+			return sessionData[0]?.id || null;
+		} catch (error) {
+			console.error('Error creating Supabase session:', error);
+			return null;
+		}
+	}
+
+	private async loadActionHistoryFromStorage(
+		sessionId: string,
+		session: IChatSession,
+	): Promise<void> {
+		try {
+			// Load actions from Cloudflare storage
+			const actions = await this.loadSessionActionsFromStorage(sessionId);
+			if (actions && actions.length > 0) {
+				session.actions = actions;
+				console.log(
+					'📚 Loaded',
+					actions.length,
+					'actions from Cloudflare storage for session:',
+					sessionId,
+				);
+			}
+		} catch (error) {
+			console.error('Error loading action history from Cloudflare storage:', error);
+		}
+	}
+
+	private async loadActionHistoryFromSupabase(sessionId: string, session: any): Promise<void> {
+		try {
+			// Check if environment variables are available
+			if (!this.env || !this.env.SUPABASE_URL || !this.env.SUPABASE_SERVICE_ROLE_KEY) {
+				console.warn('Supabase environment variables not available, skipping action history load');
+				return;
+			}
+
+			const supabaseUrl = this.env.SUPABASE_URL;
+			const supabaseServiceKey = this.env.SUPABASE_SERVICE_ROLE_KEY;
+
+			// Get the full session data including metadata (with timeout)
+			const getResponse = (await Promise.race([
+				fetch(`${supabaseUrl}/rest/v1/chat_sessions?id=eq.${sessionId}&select=*`, {
+					method: 'GET',
+					headers: {
+						Authorization: `Bearer ${supabaseServiceKey}`,
+						'Content-Type': 'application/json',
+						apikey: supabaseServiceKey,
+					},
+				}),
+				new Promise((_, reject) =>
+					setTimeout(() => reject(new Error('Supabase load timeout')), 5000),
+				),
+			])) as Response;
+
+			if (!getResponse.ok) {
+				console.warn('Failed to fetch session metadata:', getResponse.status);
+				return;
+			}
+
+			const sessions = await getResponse.json();
+			if (sessions && sessions.length > 0) {
+				const sessionData = sessions[0];
+
+				// Load actions if available
+				if (sessionData.metadata?.actions) {
+					session.actions = sessionData.metadata.actions;
+					console.log(
+						'📚 Loaded',
+						session.actions.length,
+						'actions from Supabase for session:',
+						sessionId,
+					);
+				}
+
+				// Load comprehensive session metadata
+				if (sessionData.metadata) {
+					session.supabaseMetadata = sessionData.metadata;
+					console.log('📋 Loaded session metadata:', {
+						total_messages: sessionData.metadata.total_messages,
+						actions_completed: sessionData.metadata.actions_completed,
+						created_via: sessionData.metadata.created_via,
+						user_info: sessionData.metadata.user_info,
+						workspace_context: sessionData.metadata.workspace_context,
+					});
+				}
+
+				// Load user and workspace info
+				if (sessionData.user_id) {
+					session.userId = sessionData.user_id;
+				}
+				if (sessionData.workspace_id) {
+					session.workspaceId = sessionData.workspace_id;
+				}
+			}
+		} catch (error) {
+			console.error('Error loading action history from Supabase:', error);
+		}
+	}
+
+	private async continueAIResponseWithFunctionResult(
+		webSocket: WebSocket,
+		functionResultMessage: any,
+		messageId: string,
+		sessionId: string,
+		functionName: string,
+		actionMetadata?: any,
+	): Promise<void> {
+		try {
+			console.log('🔧 Continue AI response started for session:', sessionId);
+			const openaiApiKey = this.env.OPENAI_API_KEY;
+			if (!openaiApiKey) {
+				throw new Error('OpenAI API key not configured');
+			}
+
+			// Get the current session to access conversation history
+			const session = this.sessions.get(sessionId);
+			console.log(
+				'📚 Session found:',
+				!!session,
+				'Available sessions:',
+				Array.from(this.sessions.keys()),
+			);
+			if (!session) {
+				throw new Error('Session not found');
+			}
+
+			// Build the conversation history including action context
+			const messages = this.buildConversationContext(
+				session,
+				functionResultMessage,
+				functionName,
+				actionMetadata,
+			);
+
+			const response = await this.retryOpenAICall(() => 
+				fetch('https://api.openai.com/v1/chat/completions', {
+					method: 'POST',
+					headers: {
+						Authorization: `Bearer ${openaiApiKey}`,
+						'Content-Type': 'application/json',
+					},
+					body: JSON.stringify({
+						model: 'gpt-3.5-turbo',
+						messages: messages,
+						stream: true,
+						temperature: 0.7,
+						max_tokens: 1000,
+					}),
+				})
+			);
+
+			const reader = response.body?.getReader();
+			if (!reader) {
+				throw new Error('No response body reader available');
+			}
+
+			const decoder = new TextDecoder();
+			let buffer = '';
+
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+
+				buffer += decoder.decode(value, { stream: true });
+				const lines = buffer.split('\n');
+				buffer = lines.pop() || '';
+
+				for (const line of lines) {
+					if (line.startsWith('data: ')) {
+						const data = line.slice(6);
+						if (data === '[DONE]') {
+							break;
+						}
+
+						try {
+							const parsed = JSON.parse(data);
+							const choice = parsed.choices?.[0];
+							const content = choice?.delta?.content;
+
+							if (content) {
+								this.sendMessage(webSocket, {
+									type: 'content',
+									content: content,
+									messageId: messageId,
+								});
+							}
+						} catch (e) {
+							// Skip invalid JSON lines
+							continue;
+						}
+					}
+				}
+			}
+
+			reader.releaseLock();
+		} catch (error) {
+			console.error('Error continuing AI response with function result:', error);
+			this.sendMessage(webSocket, {
+				type: 'error',
+				content: `Error processing function result: ${
+					error instanceof Error ? error.message : 'Unknown error'
+				}`,
+				messageId: messageId,
+			});
+		}
+	}
+
+	private async streamAIResponse(
+		webSocket: WebSocket,
+		session: IChatSession,
+		aiMessage: ChatMessage,
+		userMessage: ChatMessage,
+	): Promise<void> {
+		let streamingTimeout: NodeJS.Timeout | null = null;
+
+		try {
+			// Store the current user query for intelligent response crafting
+			this.currentUserQueries.set(session.id, userMessage.content);
+
+			// Create abort controller for this specific stream
+			const streamAbortController = new AbortController();
+			this.currentStreamAbortController = streamAbortController;
+
+			// Set up interruption handler
+			const handleInterruption = () => {
+				if (streamAbortController && !streamAbortController.signal.aborted) {
+					streamAbortController.abort();
+					this.sendMessage(webSocket, {
+						type: 'status',
+						content: 'AI response interrupted by user',
+						messageId: aiMessage.id,
+					});
+				}
+			};
+
+			// Store interruption handler for this stream
+			this.setInterruptionHandler(handleInterruption);
+
+			// Call OpenAI API with streaming
+			try {
+				const openaiApiKey = this.env.OPENAI_API_KEY;
+				if (!openaiApiKey) {
+					throw new Error('OpenAI API key not configured');
+				}
+
+				// First, discover available MCP actions
+				const mcpCapabilities = await this.getMCPCapabilities();
+				const availableActions = mcpCapabilities.actions;
+
+				console.log('🛠️ Available MCP actions for OpenAI:', availableActions.length);
+				if (availableActions.length === 0) {
+					console.warn('⚠️ No MCP actions available - AI will not be able to call MCP functions');
+				}
+
+				// Set up a timeout to prevent infinite "Calling external services" state
+				streamingTimeout = setTimeout(() => {
+					console.log('⏰ Streaming timeout reached - forcing completion');
+					if (streamAbortController && !streamAbortController.signal.aborted) {
+						streamAbortController.abort();
+					}
+				}, 30000); // 30 second timeout
+
+				const response = await this.retryOpenAICall(() =>
+					fetch('https://api.openai.com/v1/chat/completions', {
+						method: 'POST',
+						headers: {
+							Authorization: `Bearer ${openaiApiKey}`,
+							'Content-Type': 'application/json',
+						},
+						body: JSON.stringify({
+							model: 'gpt-3.5-turbo',
+							messages: this.buildMainConversationMessages(session, userMessage, availableActions),
+							stream: true,
+							temperature: 0.7,
+							max_tokens: 1000,
+							tools: availableActions,
+							tool_choice: 'auto',
+						}),
+						// Don't use signal in retry to avoid conflicts
+						// signal: streamAbortController.signal,
+					})
+				);
+
+				const reader = response.body?.getReader();
+				if (!reader) {
+					throw new Error('No response body reader available');
+				}
+
+				const decoder = new TextDecoder();
+				let buffer = '';
+				let accumulatedToolCalls: any[] = [];
+
+				while (true) {
+					// Check for interruption
+					if (streamAbortController.signal.aborted) {
+						console.log('🛑 AI response interrupted by user');
+						reader.cancel();
+						break;
+					}
+
+					const { done, value } = await reader.read();
+					if (done) break;
+
+					buffer += decoder.decode(value, { stream: true });
+					const lines = buffer.split('\n');
+					buffer = lines.pop() || '';
+
+					for (const line of lines) {
+						if (line.startsWith('data: ')) {
+							const data = line.slice(6);
+							if (data === '[DONE]') {
+								break;
+							}
+
+							try {
+								const parsed = JSON.parse(data);
+								const choice = parsed.choices?.[0];
+
+								// Handle content streaming
+								const content = choice?.delta?.content;
+								if (content) {
+									aiMessage.content += content;
+
+									this.sendMessage(webSocket, {
+										type: 'content',
+										content: content,
+										messageId: aiMessage.id,
+									});
+								}
+
+								// Handle tool calls (streaming - may be incomplete)
+								const toolCalls = choice?.delta?.tool_calls;
+								if (toolCalls) {
+									for (const toolCall of toolCalls) {
+										const index = toolCall.index || 0;
+
+										// Initialize tool call if it doesn't exist
+										if (!accumulatedToolCalls[index]) {
+											accumulatedToolCalls[index] = {
+												id: toolCall.id || '',
+												type: 'function',
+												function: {
+													name: '',
+													arguments: '',
+												},
+											};
+										}
+
+										// Accumulate the function name and arguments
+										if (toolCall.function?.name) {
+											accumulatedToolCalls[index].function.name = toolCall.function.name;
+										}
+										if (toolCall.function?.arguments) {
+											accumulatedToolCalls[index].function.arguments += toolCall.function.arguments;
+										}
+									}
+								}
+
+								// Handle complete tool calls (when the entire tool call is received)
+								const completeToolCalls = choice?.tool_calls;
+								if (completeToolCalls) {
+									for (const toolCall of completeToolCalls) {
+										if (toolCall.function) {
+											console.log(
+												'🔧 Processing complete tool call:',
+												toolCall.function.name,
+												'with args:',
+												toolCall.function.arguments,
+											);
+
+											// Validate that we have complete arguments
+											if (
+												!toolCall.function.arguments ||
+												toolCall.function.arguments.trim() === ''
+											) {
+												console.log('❌ Tool call has empty arguments, skipping execution');
+												continue;
+											}
+
+											// Try to parse arguments to ensure they're valid JSON
+											try {
+												const parsedArgs = JSON.parse(toolCall.function.arguments);
+												console.log('✅ Tool call arguments are valid JSON:', parsedArgs);
+											} catch (error) {
+												console.log(
+													'❌ Tool call arguments are not valid JSON, skipping execution:',
+													error,
+												);
+												continue;
+											}
+
+											// Send function call notification
+											this.sendMessage(webSocket, {
+												type: 'function_call',
+												content: `Calling ${toolCall.function.name}...`,
+												data: {
+													functionName: toolCall.function.name,
+													arguments: toolCall.function.arguments,
+												},
+												messageId: aiMessage.id,
+											});
+
+											// Execute the MCP function
+											await this.executeMCPAction(
+												webSocket,
+												{
+													name: toolCall.function.name,
+													arguments: toolCall.function.arguments,
+												},
+												aiMessage.id,
+												session.id,
+											);
+										}
+									}
+								}
+							} catch (e) {
+								// Skip invalid JSON lines
+								continue;
+							}
+						}
+					}
+				}
+
+				reader.releaseLock();
+
+				clearTimeout(streamingTimeout);
+
+
+				// Execute any accumulated tool calls that appear to be complete
+				let executedCount = 0;
+				for (const toolCall of accumulatedToolCalls) {
+					if (toolCall && toolCall.function.name && toolCall.function.arguments) {
+						// Validate that we have complete arguments
+						if (toolCall.function.arguments.trim() === '') {
+							continue;
+						}
+
+						// Try to parse arguments to ensure they're valid JSON
+						try {
+							const parsedArgs = JSON.parse(toolCall.function.arguments);
+						} catch (error) {
+							continue;
+						}
+
+						// Send function call notification
+						this.sendMessage(webSocket, {
+							type: 'function_call',
+							content: `Calling ${toolCall.function.name}...`,
+							data: {
+								functionName: toolCall.function.name,
+								arguments: toolCall.function.arguments,
+							},
+							messageId: aiMessage.id,
+						});
+
+						// Execute the MCP function
+						await this.executeMCPAction(
+							webSocket,
+							{
+								name: toolCall.function.name,
+								arguments: toolCall.function.arguments,
+							},
+							aiMessage.id,
+							session.id,
+						);
+
+						executedCount++;
+					}
+				}
+
+			} catch (error) {
+				console.error('OpenAI API error:', error);
+
+				// Clear the timeout since we're handling the error
+				if (streamingTimeout) {
+					clearTimeout(streamingTimeout);
+				}
+
+				// Send error message to client
+				this.sendMessage(webSocket, {
+					type: 'error',
+					content: `AI Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+					messageId: aiMessage.id,
+				});
+				return;
+			}
+
+			// Only send completion if not interrupted
+			if (!streamAbortController.signal.aborted) {
+				// Send completion signal first
+				this.sendMessage(webSocket, {
+					type: 'complete',
+					content: aiMessage.content,
+					messageId: aiMessage.id,
+				});
+
+				// Note: AI message saving is now handled by the WebSocket client
+				// after receiving the complete signal to ensure proper content
+			}
+
+			// Clean up
+			this.clearInterruptionHandler();
+		} catch (error) {
+			console.error('Error streaming AI response:', error);
+			this.sendError(webSocket, 'Failed to stream AI response');
+		} finally {
+			// Always clear the timeout
+			if (streamingTimeout) {
+				clearTimeout(streamingTimeout);
+			}
+		}
+	}
+
+	private async delayWithInterruption(ms: number, abortController: AbortController): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const timeout = setTimeout(resolve, ms);
+
+			abortController.signal.addEventListener('abort', () => {
+				clearTimeout(timeout);
+				reject(new Error('Interrupted'));
+			});
+		});
+	}
+
+	private interruptionHandler: (() => void) | null = null;
+
+	private setInterruptionHandler(handler: () => void): void {
+		this.interruptionHandler = handler;
+	}
+
+	private clearInterruptionHandler(): void {
+		this.interruptionHandler = null;
+	}
+
+	private handleInterrupt(): void {
+		console.log('🛑 Interrupt signal received');
+
+		if (this.interruptionHandler) {
+			this.interruptionHandler();
+		}
+
+		if (this.isStreaming && this.currentStreamAbortController) {
+			this.currentStreamAbortController.abort();
+			this.isStreaming = false;
+			this.currentStreamAbortController = null;
+
+			// Notify all connected clients
+			this.broadcast({
+				type: 'status',
+				content: 'AI response interrupted',
+			});
+		}
+	}
+
+	private handlePause(): void {
+		if (this.isStreaming && this.currentStreamAbortController) {
+			this.currentStreamAbortController.abort();
+			this.isStreaming = false;
+
+			this.broadcast({
+				type: 'status',
+				content: 'AI response paused',
+			});
+		}
+	}
+
+	private handleResume(): void {
+		// TODO: Implement resume functionality
+		this.broadcast({
+			type: 'status',
+			content: 'Resume not yet implemented',
+		});
+	}
+
+	private sendMessage(webSocket: WebSocket, message: WebSocketMessage): void {
+		if (webSocket.readyState === WebSocket.OPEN) {
+			webSocket.send(JSON.stringify(message));
+		}
+	}
+
+	private sendError(webSocket: WebSocket, error: string): void {
+		this.sendMessage(webSocket, {
+			type: 'error',
+			content: error,
+		});
+	}
+
+	private sendStatus(webSocket: WebSocket, status: string): void {
+		this.sendMessage(webSocket, {
+			type: 'status',
+			content: status,
+		});
+	}
+
+	private broadcast(message: WebSocketMessage): void {
+		this.activeConnections.forEach((webSocket) => {
+			this.sendMessage(webSocket, message);
+		});
+	}
+
+	private cleanupConnection(webSocket: WebSocket): void {
+		// Remove from active connections
+		for (const [id, ws] of this.activeConnections.entries()) {
+			if (ws === webSocket) {
+				this.activeConnections.delete(id);
+				break;
+			}
+		}
+	}
+
+	private getSessionIdFromWebSocket(webSocket: WebSocket): string | null {
+		// Find the session ID associated with this WebSocket connection
+		console.log(
+			'🔍 Looking for WebSocket in connections. Total connections:',
+			this.activeConnections.size,
+		);
+		for (const [id, ws] of this.activeConnections.entries()) {
+			console.log('🔍 Checking connection:', id, ws === webSocket ? '✅ MATCH' : '❌ no match');
+			if (ws === webSocket) {
+				return id;
+			}
+		}
+		console.log('❌ WebSocket not found in active connections');
+		return null;
+	}
+
+	private generateId(): string {
+		return Date.now().toString(36) + Math.random().toString(36).substr(2);
+	}
+
+	// Session cleanup and memory management
+	private cleanupInactiveSessions(): void {
+		const now = Date.now();
+		const sessionsToDelete: string[] = [];
+
+		for (const [sessionId, session] of this.sessions.entries()) {
+			const lastActivity = session.lastActivity?.getTime() || session.createdAt.getTime();
+			if (now - lastActivity > this.SESSION_TIMEOUT) {
+				sessionsToDelete.push(sessionId);
+			}
+		}
+
+		for (const sessionId of sessionsToDelete) {
+			this.sessions.delete(sessionId);
+			// Flush any pending message buffer
+			this.flushMessageBuffer(sessionId);
+			console.log(`🧹 Cleaned up inactive session: ${sessionId}`);
+		}
+	}
+
+	// Optimized session retrieval with lazy loading
+	private async getOrCreateSession(
+		sessionId: string,
+		supabaseSessionId?: string,
+		workspaceId?: string,
+	): Promise<IChatSession> {
+		let session = this.sessions.get(sessionId);
+
+		if (!session) {
+			session = {
+				id: sessionId,
+				supabaseSessionId: supabaseSessionId || '',
+				userId: 'websocket-user',
+				workspaceId: workspaceId || this.workspaceId || 'default',
+				messages: [],
+				actions: [],
+				isActive: true,
+				createdAt: new Date(),
+				lastActivity: new Date(),
+			};
+
+			this.sessions.set(sessionId, session);
+
+			// Load action history from Cloudflare storage (primary) and Supabase (backup)
+			this.loadActionHistoryFromStorage(sessionId, session).catch((error) =>
+				console.warn('Failed to load action history from storage:', error),
+			);
+
+			if (this.supabaseEnabled && supabaseSessionId) {
+				this.loadActionHistoryFromSupabase(supabaseSessionId, session).catch((error) =>
+					console.warn('Failed to load action history from Supabase:', error),
+				);
+			}
+
+			// Initialize session context with contacts for better AI functionality
+			this.initializeSessionContext(sessionId, session.workspaceId).catch((error) =>
+				console.warn('Failed to initialize session context:', error),
+			);
+		} else {
+			session.lastActivity = new Date();
+			this.lastActivity = Date.now();
+			// Persist activity to Cloudflare storage
+			this.persistLastActivityToStorage().catch((error) => {
+				console.warn('Failed to persist last activity:', error);
+			});
+		}
+
+		return session;
+	}
+
+	// Enhanced connection management
+	private addConnection(sessionId: string, webSocket: WebSocket): void {
+		this.activeConnections.set(sessionId, webSocket);
+		this.lastActivity = Date.now();
+
+		// Cleanup inactive sessions periodically
+		if (this.activeConnections.size % 10 === 0) {
+			this.cleanupInactiveSessions();
+		}
+	}
+
+	// Memory usage monitoring
+	getMemoryUsage(): any {
+		return {
+			activeSessions: this.sessions.size,
+			activeConnections: this.activeConnections.size,
+			messageBuffers: this.messageBuffer.size,
+			mcpCacheExpiry: ChatSession.globalMCPCacheExpiry,
+			sessionEntities: this.sessionEntities.size,
+			mcpResponseCache: this.mcpResponseCache.size,
+			lastActivity: new Date(this.lastActivity).toISOString(),
+		};
+	}
+
+	// Enhanced MCP Helper Methods
+	private sendMCPStatusUpdate(
+		webSocket: WebSocket,
+		statusUpdate: MCPStatusUpdate,
+		messageId: string,
+	): void {
+		this.sendMessage(webSocket, {
+			type: 'status',
+			content: `${statusUpdate.status}: ${statusUpdate.details || statusUpdate.action || ''}`,
+			data: statusUpdate,
+			messageId,
+		});
+	}
+
+	private async checkMCPCache(functionCall: any): Promise<any | null> {
+		if (!this.isCacheableOperation(functionCall.name)) {
+			return null;
+		}
+
+		const cacheKey = `${functionCall.name}:${JSON.stringify(functionCall.arguments)}`;
+		const cached = this.mcpResponseCache.get(cacheKey);
+
+		if (cached && Date.now() < cached.expiry) {
+			return cached.data;
+		}
+
+		return null;
+	}
+
+	private isCacheableOperation(functionName: string): boolean {
+		return [
+			'contacts_search',
+			'contacts_get_all',
+			'calendar_get_upcoming_events',
+			'calendar_list_events',
+			'email_read_email',
+			'meeting_list_meetings',
+			'meeting_get_meeting',
+		].includes(functionName);
+	}
+
+	private parseAndEnhanceArguments(functionCall: any, sessionId: string): any {
+		let args: any = {};
+
+		// Parse original arguments
+		try {
+			args = JSON.parse(functionCall.arguments || '{}');
+		} catch (e) {
+			console.warn('⚠️ Failed to parse function arguments, using empty object');
+			args = {};
+		}
+
+		// Get session for context
+		const session = this.sessions.get(sessionId);
+
+		// 🔍 LOG: Track what IDs we're about to use
+		console.log('🔍 [MCP_ARGS_DEBUG] Parsing arguments for function:', functionCall.name);
+		console.log('  - sessionId:', sessionId);
+		console.log('  - session found:', !!session);
+		console.log('  - session.userId:', session?.userId);
+		console.log('  - session.workspaceId:', session?.workspaceId);
+		console.log('  - this.workspaceId:', this.workspaceId);
+		console.log('  - original args:', functionCall.arguments);
+
+		// Always add required context parameters if not present
+		if (!args.workspace_id) {
+			args.workspace_id = this.workspaceId || 'default-workspace';
+			console.log(
+				'🔍 [MCP_ARGS_DEBUG] Added workspace_id from this.workspaceId:',
+				args.workspace_id,
+			);
+		} else {
+			console.log('🔍 [MCP_ARGS_DEBUG] Using existing workspace_id:', args.workspace_id);
+		}
+
+		if (!args.user_id) {
+			args.user_id = session?.userId || 'websocket-user';
+			console.log('🔍 [MCP_ARGS_DEBUG] Added user_id from session.userId:', args.user_id);
+		} else {
+			console.log('🔍 [MCP_ARGS_DEBUG] Using existing user_id:', args.user_id);
+		}
+
+		// Add email_id for email_send_email function if not present
+		if (functionCall.name === 'email_send_email' && !args.email_id) {
+			const emailId = this.getEmailDraftId(sessionId);
+			if (emailId) {
+				args.email_id = emailId;
+				console.log('🔍 [MCP_ARGS_DEBUG] Added email_id from tracked draft:', args.email_id);
+			} else {
+				console.log('⚠️ [MCP_ARGS_DEBUG] No email draft found for session, cannot send email');
+			}
+		}
+
+		console.log('🔧 Enhanced arguments with context:', {
+			workspace_id: args.workspace_id,
+			user_id: args.user_id,
+			original_args: functionCall.arguments,
+		});
+
+		// Enhance arguments with contextual entity resolution
+		return this.resolveEntityReferences(args, sessionId, functionCall.name);
+	}
+
+	private resolveEntityReferences(args: any, sessionId: string, actionName: string): any {
+		const entityContext = this.sessionEntities.get(sessionId);
+
+		if (!entityContext) {
+			
+			return args;
+		}
+
+		const enhancedArgs = { ...args };
+
+		// Resolve contact references for both parameter naming conventions
+		if (actionName.includes('email') && args.recipient_emails) {
+			enhancedArgs.recipient_emails = this.resolveContactEmails(
+				args.recipient_emails,
+				entityContext,
+			);
+		}
+
+		// Handle to_emails parameter (primary parameter name for email functions)
+		if (actionName.includes('email') && args.to_emails) {
+			enhancedArgs.to_emails = this.resolveContactEmails(args.to_emails, entityContext);
+		}
+
+		// Handle cc_emails and bcc_emails as well
+		if (actionName.includes('email') && args.cc_emails) {
+			enhancedArgs.cc_emails = this.resolveContactEmails(args.cc_emails, entityContext);
+		}
+
+		if (actionName.includes('email') && args.bcc_emails) {
+			enhancedArgs.bcc_emails = this.resolveContactEmails(args.bcc_emails, entityContext);
+		}
+
+		if (actionName.includes('meeting') && args.attendee_emails) {
+			enhancedArgs.attendee_emails = this.resolveContactEmails(args.attendee_emails, entityContext);
+		}
+
+		// Resolve email/meeting ID references
+		if (args.email_id && !this.isValidId(args.email_id)) {
+			enhancedArgs.email_id = this.findEmailId(args.email_id, entityContext);
+		}
+
+		if (args.meeting_id && !this.isValidId(args.meeting_id)) {
+			enhancedArgs.meeting_id = this.findMeetingId(args.meeting_id, entityContext, sessionId);
+		}
+
+		return enhancedArgs;
+	}
+
+	private resolveContactEmails(emailsOrNames: string[], entityContext: MCPEntityContext): string[] {
+		console.log('🔍 [CONTACT_RESOLUTION_DEBUG] Resolving contact emails:');
+		console.log('  - emailsOrNames:', emailsOrNames);
+		console.log(
+			'  - available contacts:',
+			entityContext.contacts.map((c) => ({ name: c.name, email: c.email })),
+		);
+
+		return emailsOrNames.map((emailOrName) => {
+			// If it's already an email, return as-is
+			if (emailOrName.includes('@')) {
+				console.log(`✅ [CONTACT_RESOLUTION_DEBUG] ${emailOrName} is already an email`);
+				return emailOrName;
+			}
+
+			// Try to find contact by name
+			const contact = entityContext.contacts.find(
+				(c) =>
+					c.name.toLowerCase().includes(emailOrName.toLowerCase()) ||
+					emailOrName.toLowerCase().includes(c.name.toLowerCase()),
+			);
+
+			if (contact) {
+				console.log(
+					`✅ [CONTACT_RESOLUTION_DEBUG] Resolved "${emailOrName}" to "${contact.email}"`,
+				);
+				return contact.email;
+			} else {
+				console.log(`⚠️ [CONTACT_RESOLUTION_DEBUG] Could not resolve "${emailOrName}" to an email`);
+				return emailOrName;
+			}
+		});
+	}
+
+	private findEmailId(emailReference: string, entityContext: MCPEntityContext): string {
+		const email = entityContext.emails.find(
+			(e) =>
+				e.subject.toLowerCase().includes(emailReference.toLowerCase()) ||
+				emailReference.toLowerCase().includes(e.subject.toLowerCase()),
+		);
+		return email ? email.id : emailReference;
+	}
+
+	private findMeetingId(meetingReference: string, entityContext: MCPEntityContext, sessionId?: string): string {
+		// First try to find from entity context
+		const meeting = entityContext.meetings.find(
+			(m) =>
+				m.title.toLowerCase().includes(meetingReference.toLowerCase()) ||
+				meetingReference.toLowerCase().includes(m.title.toLowerCase()),
+		);
+		
+		if (meeting) {
+			return meeting.id;
+		}
+
+		// If not found in entity context, try to get from recent session actions
+		if (sessionId) {
+			const session = this.sessions.get(sessionId);
+			if (session?.actions) {
+				// Get the most recent meeting action with an ID
+				const recentMeetingActions = session.actions
+					.filter((action: any) => 
+						action.functionName && 
+						action.functionName.includes('meeting') && 
+						action.meetingId
+					)
+					.slice(-3); // Last 3 meeting actions
+
+				if (recentMeetingActions.length > 0) {
+					// Return the most recent meeting ID
+					const mostRecentMeeting = recentMeetingActions[recentMeetingActions.length - 1];
+					console.log(`🔍 Found recent meeting ID from actions: ${mostRecentMeeting.meetingId}`);
+					return mostRecentMeeting.meetingId;
+				}
+			}
+		}
+
+		return meetingReference;
+	}
+
+	private isValidId(id: string): boolean {
+		// Check if it looks like a valid ID (not just a name/description)
+		// Allow more flexible ID formats and shorter IDs
+		if (!id || typeof id !== 'string') return false;
+		
+		// If it contains spaces or looks like a description, it's not a valid ID
+		if (id.includes(' ') || id.toLowerCase().includes('context') || id.toLowerCase().includes('previous')) {
+			return false;
+		}
+		
+		// Check if it's a reasonable ID format (alphanumeric with common separators)
+		return /^[a-zA-Z0-9_.-]+$/.test(id) && id.length >= 5;
+	}
+
+	private async executeMCPCallWithRetry(
+		mcpServerUrl: string,
+		requestBody: any,
+		webSocket: WebSocket,
+		messageId: string,
+		maxRetries: number = 3,
+	): Promise<any> {
+		let lastError: Error;
+
+		for (let attempt = 0; attempt < maxRetries; attempt++) {
+			try {
+				const response = await fetch(mcpServerUrl, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+					},
+					body: JSON.stringify(requestBody),
+				});
+
+				if (!response.ok) {
+					const errorText = await response.text();
+					throw new Error(
+						`MCP server error: ${response.status} ${response.statusText} - ${errorText}`,
+					);
+				}
+
+				return await response.json();
+			} catch (error) {
+				lastError = error as Error;
+
+				if (attempt < maxRetries - 1) {
+					const delay = Math.pow(2, attempt) * 1000; // Exponential backoff
+					this.sendMCPStatusUpdate(
+						webSocket,
+						{
+							status: 'calling_tool',
+							details: `Retrying MCP call (attempt ${attempt + 2}/${maxRetries})...`,
+						},
+						messageId,
+					);
+
+					await new Promise((resolve) => setTimeout(resolve, delay));
+				}
+			}
+		}
+
+		throw lastError!;
+	}
+
+	private async processMCPResult(
+		webSocket: WebSocket,
+		result: any,
+		functionCall: any,
+		messageId: string,
+		sessionId: string,
+	): Promise<void> {
+		// Send status update: Processing results
+		this.sendMCPStatusUpdate(
+			webSocket,
+			{
+				status: 'processing_results',
+				action: functionCall.name,
+				details: 'Crafting intelligent response...',
+			},
+			messageId,
+		);
+
+		// Store entities in context for future reference (with Cloudflare persistence)
+		await this.storeEntitiesInContextWithPersistence(result, functionCall.name, sessionId);
+
+		// Cache the result if it's cacheable (with Cloudflare persistence)
+		if (this.isCacheableOperation(functionCall.name)) {
+			const cacheKey = `${functionCall.name}:${JSON.stringify(functionCall.arguments)}`;
+			await this.storeMCPCacheWithPersistence(
+				cacheKey,
+				result,
+				Date.now() + this.MCP_RESPONSE_CACHE_TTL,
+				functionCall.name,
+			);
+		}
+
+		// Extract action metadata for context preservation
+		const actionMetadata = this.extractActionMetadata(functionCall.name, result);
+
+		// Store action in session for context continuity
+		if (actionMetadata) {
+			this.storeActionInSession(sessionId, actionMetadata);
+		}
+
+		// Track email drafts for sending functionality
+		if (functionCall.name === 'email_draft_email' && result && result.email_id) {
+			this.trackEmailDraft(sessionId, result.email_id);
+		}
+
+		try {
+			// Get the original user query for intelligent response crafting
+			const originalUserQuery = this.currentUserQueries.get(sessionId) || 'User request';
+
+			// Use intelligent response service to craft user-friendly response
+			const intelligentService = this.getIntelligentResponseService();
+			const craftedResponse = await intelligentService.craftUserResponse({
+				functionName: functionCall.name,
+				originalUserQuery,
+				mcpResult: result,
+				actionMetadata,
+				userContext: {
+					preferences: this.userPreferences.get(sessionId),
+					previousActions: this.getSessionActions(sessionId),
+				},
+			});
+
+			console.log('🧠 Crafted intelligent response:', craftedResponse.userMessage);
+
+			// Send the crafted user message directly to the client
+			this.sendMessage(webSocket, {
+				type: 'content',
+				content: craftedResponse.userMessage,
+				messageId: messageId,
+			});
+
+			// Send completion signal
+			this.sendMessage(webSocket, {
+				type: 'complete',
+				content: craftedResponse.userMessage,
+				messageId: messageId,
+			});
+
+			// Clean up the user query
+			this.currentUserQueries.delete(sessionId);
+		} catch (error) {
+			console.error('❌ Error in intelligent response crafting:', error);
+
+			// Fallback to the old method if intelligent response fails
+			const enhancedResult = this.enhanceMCPResultForUserLocal(
+				result,
+				functionCall.name,
+				actionMetadata,
+			);
+
+			// Send function result with metadata to client
+			this.sendMessage(webSocket, {
+				type: 'function_result',
+				content: JSON.stringify(enhancedResult),
+				data: {
+					result: enhancedResult,
+					actionMetadata: actionMetadata,
+					functionName: functionCall.name,
+				},
+				messageId: messageId,
+			});
+
+			// Send function result back to OpenAI for processing
+			const functionResultMessage = {
+				role: 'tool',
+				tool_call_id: functionCall.id || 'mcp_call',
+				content: JSON.stringify(enhancedResult),
+			};
+
+			// Let OpenAI process the function result and generate a proper response
+			await this.continueAIResponseWithFunctionResult(
+				webSocket,
+				functionResultMessage,
+				messageId,
+				sessionId,
+				functionCall.name,
+				actionMetadata,
+			);
+		}
+	}
+
+	/**
+	 * Initialize session context by loading essential data like contacts
+	 */
+	private async initializeSessionContext(sessionId: string, workspaceId: string): Promise<void> {
+		try {
+			console.log(`🔄 Initializing session context for ${sessionId} in workspace ${workspaceId}`);
+
+			// Load contacts automatically to enable email functionality
+			await this.loadContactsForSession(sessionId, workspaceId);
+
+			// Could also load recent emails, calendar events, etc. in the future
+			console.log(`✅ Session context initialized for ${sessionId}`);
+		} catch (error) {
+			console.error(`❌ Failed to initialize session context for ${sessionId}:`, error);
+		}
+	}
+
+	/**
+	 * Load contacts for a session to enable email/contact functionality
+	 */
+	private async loadContactsForSession(sessionId: string, workspaceId: string): Promise<void> {
+		try {
+			// Get the real user ID from session
+			const session = this.sessions.get(sessionId);
+			const userId = session?.userId || 'websocket-user';
+
+			console.log('🔍 [LOAD_CONTACTS_DEBUG] Loading contacts for session:');
+			console.log('  - sessionId:', sessionId);
+			console.log('  - workspaceId:', workspaceId);
+			console.log('  - session found:', !!session);
+			console.log('  - session.userId:', session?.userId);
+			console.log('  - final userId used:', userId);
+
+			// Call the MCP server to get contacts
+			const contactsResult = await this.callMCPMethod('invokeAction', {
+				name: 'contacts_get_all',
+				arguments: {
+					workspace_id: workspaceId,
+					user_id: userId,
+					limit: 50, // Load first 50 contacts
+				},
+			});
+
+			if (contactsResult && Array.isArray(contactsResult)) {
+				// Store the contacts in session context
+				await this.storeEntitiesInContext(contactsResult, 'contacts_get_all', sessionId);
+				console.log(`📇 Loaded ${contactsResult.length} contacts for session ${sessionId}`);
+			} else {
+				console.log(`📇 No contacts found for session ${sessionId}`);
+			}
+		} catch (error) {
+			console.warn(`⚠️ Failed to load contacts for session ${sessionId}:`, error);
+		}
+	}
+
+	private async storeEntitiesInContext(
+		result: any,
+		actionName: string,
+		sessionId: string,
+	): Promise<void> {
+		let entityContext = this.sessionEntities.get(sessionId);
+		if (!entityContext) {
+			entityContext = {
+				contacts: [],
+				emails: [],
+				meetings: [],
+				lastUpdated: Date.now(),
+			};
+		}
+
+		// Store different types of entities based on action
+		if (actionName.includes('contacts')) {
+			if (Array.isArray(result)) {
+				// Store contacts from search or get_all
+				result.forEach((contact) => {
+					if (contact.id && contact.name) {
+						const existingIndex = entityContext!.contacts.findIndex((c) => c.id === contact.id);
+						if (existingIndex >= 0) {
+							entityContext!.contacts[existingIndex] = {
+								id: contact.id,
+								name: contact.name,
+								email: contact.email || contact.primary_email,
+								metadata: contact,
+							};
+						} else {
+							entityContext!.contacts.push({
+								id: contact.id,
+								name: contact.name,
+								email: contact.email || contact.primary_email,
+								metadata: contact,
+							});
+						}
+					}
+				});
+			}
+		}
+
+		if (actionName.includes('email')) {
+			if (result.id) {
+				// Store single email
+				const existingIndex = entityContext.emails.findIndex((e) => e.id === result.id);
+				const emailEntity = {
+					id: result.id,
+					subject: result.subject || 'Untitled Email',
+					status: result.status || 'draft',
+					metadata: result,
+				};
+
+				if (existingIndex >= 0) {
+					entityContext.emails[existingIndex] = emailEntity;
+				} else {
+					entityContext.emails.push(emailEntity);
+				}
+			} else if (Array.isArray(result)) {
+				// Store multiple emails
+				result.forEach((email) => {
+					if (email.id) {
+						const existingIndex = entityContext!.emails.findIndex((e) => e.id === email.id);
+						const emailEntity = {
+							id: email.id,
+							subject: email.subject || 'Untitled Email',
+							status: email.status || 'unknown',
+							metadata: email,
+						};
+
+						if (existingIndex >= 0) {
+							entityContext!.emails[existingIndex] = emailEntity;
+						} else {
+							entityContext!.emails.push(emailEntity);
+						}
+					}
+				});
+			}
+		}
+
+		if (actionName.includes('meeting') || actionName.includes('calendar')) {
+			if (result.id || result.meeting_id || result.event_id) {
+				// Store single meeting/event
+				const meetingId = result.id || result.meeting_id || result.event_id;
+				const existingIndex = entityContext.meetings.findIndex((m) => m.id === meetingId);
+				const meetingEntity = {
+					id: meetingId,
+					title: result.title || result.summary || result.subject || 'Untitled Meeting',
+					status: result.status || 'draft',
+					metadata: result,
+				};
+
+				if (existingIndex >= 0) {
+					entityContext.meetings[existingIndex] = meetingEntity;
+				} else {
+					entityContext.meetings.push(meetingEntity);
+				}
+			} else if (Array.isArray(result)) {
+				// Store multiple meetings/events
+				result.forEach((meeting) => {
+					const meetingId = meeting.id || meeting.meeting_id || meeting.event_id;
+					if (meetingId) {
+						const existingIndex = entityContext!.meetings.findIndex((m) => m.id === meetingId);
+						const meetingEntity = {
+							id: meetingId,
+							title: meeting.title || meeting.summary || meeting.subject || 'Untitled Meeting',
+							status: meeting.status || 'unknown',
+							metadata: meeting,
+						};
+
+						if (existingIndex >= 0) {
+							entityContext!.meetings[existingIndex] = meetingEntity;
+						} else {
+							entityContext!.meetings.push(meetingEntity);
+						}
+					}
+				});
+			}
+		}
+
+		// Update timestamp and store
+		entityContext.lastUpdated = Date.now();
+		this.sessionEntities.set(sessionId, entityContext);
+
+		// Limit entity storage to prevent memory bloat
+		this.limitEntityStorage(entityContext);
+	}
+
+	private limitEntityStorage(entityContext: MCPEntityContext): void {
+		// Keep only the most recent 50 entities of each type
+		if (entityContext.contacts.length > 50) {
+			entityContext.contacts = entityContext.contacts.slice(-50);
+		}
+		if (entityContext.emails.length > 50) {
+			entityContext.emails = entityContext.emails.slice(-50);
+		}
+		if (entityContext.meetings.length > 50) {
+			entityContext.meetings = entityContext.meetings.slice(-50);
+		}
+	}
+
+	private async handleChatAPI(request: Request): Promise<Response> {
+		const url = new URL(request.url);
+		const sessionId = url.searchParams.get('sessionId');
+
+		if (!sessionId) {
+			return new Response('Session ID required', { status: 400 });
+		}
+
+		const session = this.sessions.get(sessionId);
+		if (!session) {
+			return new Response('Session not found', { status: 404 });
+		}
+
+		return new Response(JSON.stringify(session), {
+			headers: { 'Content-Type': 'application/json' },
+		});
+	}
+
+	// Cloudflare Storage Persistence Methods
+	private async persistSessionEntitiesToStorage(): Promise<void> {
+		try {
+			if (!this.storage) {
+				console.warn('⚠️ Storage not available - skipping entity persistence');
+				return;
+			}
+			const entitiesObject = Object.fromEntries(this.sessionEntities);
+			await this.storage.put(this.STORAGE_KEYS.SESSION_ENTITIES, entitiesObject);
+			console.log('💾 Persisted session entities to Cloudflare storage');
+		} catch (error) {
+			console.error('❌ Failed to persist session entities to storage:', error);
+		}
+	}
+
+	private async persistMCPCacheToStorage(): Promise<void> {
+		try {
+			if (!this.storage) {
+				console.warn('⚠️ Storage not available - skipping cache persistence');
+				return;
+			}
+			// Only persist non-expired cache entries
+			const validCache = new Map<string, MCPCacheEntry>();
+			const now = Date.now();
+
+			for (const [key, entry] of this.mcpResponseCache) {
+				if (now < entry.expiry) {
+					validCache.set(key, entry);
+				}
+			}
+
+			const cacheObject = Object.fromEntries(validCache);
+			await this.storage.put(this.STORAGE_KEYS.MCP_CACHE, cacheObject);
+			console.log('💾 Persisted MCP cache to Cloudflare storage');
+		} catch (error) {
+			console.error('❌ Failed to persist MCP cache to storage:', error);
+		}
+	}
+
+	private async persistSessionActionsToStorage(sessionId: string, actions: any[]): Promise<void> {
+		try {
+			if (!this.storage) {
+				console.warn('⚠️ Storage not available - skipping action persistence');
+				return;
+			}
+			const storageKey = `${this.STORAGE_KEYS.SESSION_ACTIONS}:${sessionId}`;
+			await this.storage.put(storageKey, actions);
+			console.log('💾 Persisted session actions to Cloudflare storage for session:', sessionId);
+		} catch (error) {
+			console.error('❌ Failed to persist session actions to storage:', error);
+		}
+	}
+
+	private async persistLastActivityToStorage(): Promise<void> {
+		try {
+			if (!this.storage) {
+				return;
+			}
+			await this.storage.put(this.STORAGE_KEYS.LAST_ACTIVITY, this.lastActivity);
+		} catch (error) {
+			console.error('❌ Failed to persist last activity to storage:', error);
+		}
+	}
+
+	private async loadSessionActionsFromStorage(sessionId: string): Promise<any[]> {
+		try {
+			if (!this.storage) {
+				return [];
+			}
+			const storageKey = `${this.STORAGE_KEYS.SESSION_ACTIONS}:${sessionId}`;
+			const actions = await this.storage.get(storageKey);
+			return actions ? (actions as any[]) : [];
+		} catch (error) {
+			console.error('❌ Failed to load session actions from storage:', error);
+			return [];
+		}
+	}
+
+	// Enhanced entity storage with Cloudflare persistence
+	private async storeEntitiesInContextWithPersistence(
+		result: any,
+		actionName: string,
+		sessionId: string,
+	): Promise<void> {
+		// Store entities in memory (existing logic)
+		await this.storeEntitiesInContext(result, actionName, sessionId);
+
+		// Persist to Cloudflare storage
+		await this.persistSessionEntitiesToStorage();
+	}
+
+	// Enhanced cache storage with Cloudflare persistence
+	private async storeMCPCacheWithPersistence(
+		cacheKey: string,
+		data: any,
+		expiry: number,
+		actionType: string,
+	): Promise<void> {
+		// Store in memory cache
+		this.mcpResponseCache.set(cacheKey, {
+			data,
+			expiry,
+			actionType,
+		});
+
+		// Persist to Cloudflare storage (debounced)
+		if (this.cachePersistTimeout) {
+			clearTimeout(this.cachePersistTimeout);
+		}
+		this.cachePersistTimeout = setTimeout(() => {
+			this.persistMCPCacheToStorage();
+		}, 1000); // 1 second debounce
+	}
+
+	private cachePersistTimeout: NodeJS.Timeout | null = null;
+
+	// Enhanced User Context Methods
+	private getDefaultUserPreferences(): UserPreferences {
+		return {
+			communicationStyle: 'friendly',
+			responseLength: 'detailed',
+			defaultTimezone: 'UTC',
+			workingHours: { start: '09:00', end: '17:00' },
+			preferredMeetingDuration: 30,
+			emailSignature: '',
+			notificationPreferences: [],
+		};
+	}
+
+	private getDefaultConversationContext(): ConversationContext {
+		return {
+			userGoals: [],
+			currentTasks: [],
+			mentionedPreferences: {},
+			emotionalTone: 'neutral',
+			conversationFlow: [],
+			lastUserIntent: '',
+			pendingActions: [],
+		};
+	}
+
+	private buildPersonalizedSystemPrompt(
+		userPrefs: UserPreferences,
+		convContext: ConversationContext,
+		customPersonality?: string,
+	): string {
+		let basePersonality =
+			customPersonality ||
+			`You are Lineer, a ${userPrefs.communicationStyle} AI assistant that helps users manage their work life.`;
+
+		// Adapt response style based on user preferences
+		const styleInstructions = this.getStyleInstructions(userPrefs);
+
+		// Add conversation context
+		const contextualInfo = this.buildContextualInformation(convContext);
+
+		// Add emotional context
+		const emotionalAdaptation = this.getEmotionalAdaptation(convContext.emotionalTone);
+
+		return `${basePersonality}
+
+${styleInstructions}
+
+${contextualInfo}
+
+${emotionalAdaptation}`;
+	}
+
+	private getStyleInstructions(userPrefs: UserPreferences): string {
+		const instructions = [];
+
+		switch (userPrefs.responseLength) {
+			case 'brief':
+				instructions.push('Keep responses concise and to the point.');
+				break;
+			case 'comprehensive':
+				instructions.push('Provide detailed explanations and comprehensive information.');
+				break;
+			default:
+				instructions.push('Provide balanced, informative responses.');
+		}
+
+		switch (userPrefs.communicationStyle) {
+			case 'formal':
+				instructions.push('Maintain a professional and formal tone.');
+				break;
+			case 'casual':
+				instructions.push('Use a relaxed, conversational tone.');
+				break;
+			case 'professional':
+				instructions.push('Be professional while remaining approachable.');
+				break;
+			default:
+				instructions.push('Be warm, helpful, and engaging.');
+		}
+
+		if (userPrefs.workingHours) {
+			instructions.push(
+				`Consider the user's working hours: ${userPrefs.workingHours.start} to ${userPrefs.workingHours.end} ${userPrefs.defaultTimezone}.`,
+			);
+		}
+
+		return instructions.join(' ');
+	}
+
+	private buildContextualInformation(convContext: ConversationContext): string {
+		const info = [];
+
+		if (convContext.userGoals.length > 0) {
+			info.push(`User's current goals: ${convContext.userGoals.join(', ')}`);
+		}
+
+		if (convContext.currentTasks.length > 0) {
+			info.push(`Active tasks: ${convContext.currentTasks.join(', ')}`);
+		}
+
+		if (convContext.pendingActions.length > 0) {
+			info.push(`Pending actions: ${convContext.pendingActions.join(', ')}`);
+		}
+
+		if (Object.keys(convContext.mentionedPreferences).length > 0) {
+			const prefs = Object.entries(convContext.mentionedPreferences)
+				.map(([key, value]) => `${key}: ${value}`)
+				.join(', ');
+			info.push(`User preferences mentioned: ${prefs}`);
+		}
+
+		return info.length > 0 ? `\nContextual Information:\n${info.join('\n')}` : '';
+	}
+
+	private getEmotionalAdaptation(tone: ConversationContext['emotionalTone']): string {
+		switch (tone) {
+			case 'frustrated':
+				return '\nThe user seems frustrated. Be extra patient, acknowledge their concerns, and focus on providing clear solutions.';
+			case 'excited':
+				return '\nThe user is excited. Match their enthusiasm while staying focused on helping them achieve their goals.';
+			case 'urgent':
+				return '\nThe user has urgent needs. Prioritize quick, actionable responses and ask clarifying questions efficiently.';
+			case 'positive':
+				return '\nThe user is in a positive mood. Maintain the upbeat energy while being helpful.';
+			default:
+				return "\nMaintain a helpful, professional demeanor while being attentive to the user's needs.";
+		}
+	}
+
+	/**
+	 * Enhances MCP results with user-friendly formatting hints and context
+	 */
+	private enhanceMCPResultForUserLocal(
+		result: any,
+		functionName: string,
+		actionMetadata?: any,
+	): any {
+		return enhanceMCPResultForUser(result, functionName, actionMetadata);
+	}
+
+	/**
+	 * Gets detailed schema information for a specific MCP action
+	 * This can be used by the AI to understand required parameters
+	 */
+	private async getMCPActionSchema(resource: string, actionName: string): Promise<any> {
+		try {
+			const mcpServerUrl = this.env.MCP_SERVER_URL;
+			if (!mcpServerUrl) {
+				throw new Error('MCP_SERVER_URL not configured');
+			}
+
+			// Get actions for the specific resource
+			const actions = await this.callMCPMethod('listActions', { resource });
+
+			// Find the specific action
+			const action = actions.find((a: any) => a.name === actionName);
+			if (!action) {
+				throw new Error(`Action ${actionName} not found in resource ${resource}`);
+			}
+
+			return action;
+		} catch (error) {
+			console.error('Error getting MCP action schema:', error);
+			return null;
+		}
+	}
+
+	private async updateConversationContext(sessionId: string, userMessage: string): Promise<void> {
+		let context = this.conversationContext.get(sessionId) || this.getDefaultConversationContext();
+
+		// Analyze user message for context clues
+		context = await this.analyzeAndUpdateContext(context, userMessage);
+
+		// Update conversation flow
+		context.conversationFlow.push(userMessage);
+		if (context.conversationFlow.length > 20) {
+			context.conversationFlow = context.conversationFlow.slice(-20);
+		}
+
+		this.conversationContext.set(sessionId, context);
+
+		// Persist to storage
+		await this.persistConversationContextToStorage();
+	}
+
+	private async analyzeAndUpdateContext(
+		context: ConversationContext,
+		userMessage: string,
+	): Promise<ConversationContext> {
+		const lowerMessage = userMessage.toLowerCase();
+
+		// Detect emotional tone
+		if (
+			lowerMessage.includes('urgent') ||
+			lowerMessage.includes('asap') ||
+			lowerMessage.includes('immediately')
+		) {
+			context.emotionalTone = 'urgent';
+		} else if (
+			lowerMessage.includes('frustrated') ||
+			lowerMessage.includes('annoying') ||
+			lowerMessage.includes('problem')
+		) {
+			context.emotionalTone = 'frustrated';
+		} else if (
+			lowerMessage.includes('excited') ||
+			lowerMessage.includes('great') ||
+			lowerMessage.includes('awesome')
+		) {
+			context.emotionalTone = 'excited';
+		} else if (
+			lowerMessage.includes('thanks') ||
+			lowerMessage.includes('perfect') ||
+			lowerMessage.includes('excellent')
+		) {
+			context.emotionalTone = 'positive';
+		}
+
+		// Extract goals and tasks
+		if (
+			lowerMessage.includes('need to') ||
+			lowerMessage.includes('want to') ||
+			lowerMessage.includes('goal')
+		) {
+			// Simple goal extraction (could be enhanced with NLP)
+			const goalMatch = lowerMessage.match(/(need to|want to|goal.*?is to) ([^.!?]+)/);
+			if (goalMatch && goalMatch[2]) {
+				const goal = goalMatch[2].trim();
+				if (!context.userGoals.includes(goal)) {
+					context.userGoals.push(goal);
+					if (context.userGoals.length > 10) {
+						context.userGoals = context.userGoals.slice(-10);
+					}
+				}
+			}
+		}
+
+		// Extract preferences
+		if (
+			lowerMessage.includes('prefer') ||
+			lowerMessage.includes('like to') ||
+			lowerMessage.includes('usually')
+		) {
+			const prefMatch = lowerMessage.match(/(prefer|like to|usually) ([^.!?]+)/);
+			if (prefMatch && prefMatch[2]) {
+				const preference = prefMatch[2].trim();
+				context.mentionedPreferences[`communication_${Date.now()}`] = preference;
+			}
+		}
+
+		// Detect intent
+		if (lowerMessage.includes('email')) {
+			context.lastUserIntent = 'email_management';
+		} else if (lowerMessage.includes('meeting') || lowerMessage.includes('calendar')) {
+			context.lastUserIntent = 'calendar_management';
+		} else if (lowerMessage.includes('contact')) {
+			context.lastUserIntent = 'contact_management';
+		} else if (lowerMessage.includes('task')) {
+			context.lastUserIntent = 'task_management';
+		}
+
+		return context;
+	}
+
+	private async persistConversationContextToStorage(): Promise<void> {
+		try {
+			if (!this.storage) {
+				return;
+			}
+			const contextObject = Object.fromEntries(this.conversationContext);
+			await this.storage.put(this.STORAGE_KEYS.CONVERSATION_CONTEXT, contextObject);
+			console.log('💬 Persisted conversation context to Cloudflare storage');
+		} catch (error) {
+			console.error('❌ Failed to persist conversation context:', error);
+		}
+	}
+
+	private async persistUserPreferencesToStorage(): Promise<void> {
+		try {
+			if (!this.storage) {
+				return;
+			}
+			const preferencesObject = Object.fromEntries(this.userPreferences);
+			await this.storage.put(this.STORAGE_KEYS.USER_PREFERENCES, preferencesObject);
+			console.log('👤 Persisted user preferences to Cloudflare storage');
+		} catch (error) {
+			console.error('❌ Failed to persist user preferences:', error);
+		}
+	}
+
+	private async persistSessionPersonalitiesToStorage(): Promise<void> {
+		try {
+			if (!this.storage) {
+				return;
+			}
+			const personalitiesObject = Object.fromEntries(this.sessionPersonalities);
+			await this.storage.put(this.STORAGE_KEYS.SESSION_PERSONALITIES, personalitiesObject);
+			console.log('🎭 Persisted session personalities to Cloudflare storage');
+		} catch (error) {
+			console.error('❌ Failed to persist session personalities:', error);
+		}
+	}
+
+	// Storage Optimization Methods
+	private async cleanupExpiredData(): Promise<void> {
+		if (!this.storage) {
+			return;
+		}
+
+		try {
+			// Clean expired MCP cache
+			const now = Date.now();
+			let cleanedCount = 0;
+
+			for (const [key, entry] of this.mcpResponseCache) {
+				if (now >= entry.expiry) {
+					this.mcpResponseCache.delete(key);
+					cleanedCount++;
+				}
+			}
+
+			if (cleanedCount > 0) {
+				await this.persistMCPCacheToStorage();
+				console.log(`🧹 Cleaned ${cleanedCount} expired cache entries`);
+			}
+
+			// Clean old conversation context (keep last 50 messages)
+			for (const [sessionId, context] of this.conversationContext) {
+				if (context.conversationFlow.length > 50) {
+					context.conversationFlow = context.conversationFlow.slice(-50);
+					console.log(`🧹 Trimmed conversation history for session: ${sessionId}`);
+				}
+			}
+		} catch (error) {
+			console.error('❌ Failed to cleanup expired data:', error);
+		}
+	}
+
+	private async optimizeStorageUsage(): Promise<void> {
+		if (!this.storage) {
+			return;
+		}
+
+		try {
+			// Estimate current storage usage
+			const storageEstimate = this.estimateStorageUsage();
+
+			if (storageEstimate > this.MAX_STORAGE_SIZE) {
+				console.log(
+					`⚠️ Storage usage (${Math.round(storageEstimate / 1024)}KB) exceeds limit, optimizing...`,
+				);
+
+				// Reduce cache size
+				if (this.mcpResponseCache.size > this.CACHE_CLEANUP_THRESHOLD) {
+					const entriesToKeep = Math.floor(this.CACHE_CLEANUP_THRESHOLD * 0.7);
+					const sortedEntries = Array.from(this.mcpResponseCache.entries()).sort(
+						([, a], [, b]) => b.expiry - a.expiry,
+					); // Keep newest
+
+					this.mcpResponseCache.clear();
+					sortedEntries.slice(0, entriesToKeep).forEach(([key, value]) => {
+						this.mcpResponseCache.set(key, value);
+					});
+
+					await this.persistMCPCacheToStorage();
+					console.log(`🧹 Reduced cache from ${sortedEntries.length} to ${entriesToKeep} entries`);
+				}
+
+				// Limit entity storage per session
+				for (const [sessionId, entityContext] of this.sessionEntities) {
+					let modified = false;
+
+					if (entityContext.contacts.length > 30) {
+						entityContext.contacts = entityContext.contacts.slice(-30);
+						modified = true;
+					}
+					if (entityContext.emails.length > 20) {
+						entityContext.emails = entityContext.emails.slice(-20);
+						modified = true;
+					}
+					if (entityContext.meetings.length > 20) {
+						entityContext.meetings = entityContext.meetings.slice(-20);
+						modified = true;
+					}
+
+					if (modified) {
+						console.log(`🧹 Optimized entity storage for session: ${sessionId}`);
+					}
+				}
+
+				await this.persistSessionEntitiesToStorage();
+			}
+		} catch (error) {
+			console.error('❌ Failed to optimize storage usage:', error);
+		}
+	}
+
+	private estimateStorageUsage(): number {
+		let totalSize = 0;
+
+		// Estimate entity storage
+		for (const [, entityContext] of this.sessionEntities) {
+			totalSize += JSON.stringify(entityContext).length;
+		}
+
+		// Estimate cache storage
+		for (const [, cacheEntry] of this.mcpResponseCache) {
+			totalSize += JSON.stringify(cacheEntry).length;
+		}
+
+		// Estimate conversation context
+		for (const [, context] of this.conversationContext) {
+			totalSize += JSON.stringify(context).length;
+		}
+
+		// Estimate preferences
+		for (const [, prefs] of this.userPreferences) {
+			totalSize += JSON.stringify(prefs).length;
+		}
+
+		return totalSize;
+	}
+
+	private scheduleStorageCleanup(): void {
+		// Run cleanup every hour
+		setInterval(async () => {
+			await this.cleanupExpiredData();
+			await this.optimizeStorageUsage();
+		}, this.STORAGE_CLEANUP_INTERVAL);
+
+		console.log(
+			'🕐 Scheduled storage cleanup every',
+			this.STORAGE_CLEANUP_INTERVAL / (60 * 1000),
+			'minutes',
+		);
+	}
+
+	// Global MCP Cache Management
+	private async loadGlobalMCPCacheFromStorage(): Promise<void> {
+		try {
+			if (!this.storage) {
+				return;
+			}
+
+			const [storedCapabilities, storedExpiry] = await Promise.all([
+				this.storage.get(this.STORAGE_KEYS.GLOBAL_MCP_CAPABILITIES),
+				this.storage.get(this.STORAGE_KEYS.GLOBAL_MCP_CACHE_EXPIRY),
+			]);
+
+			if (storedCapabilities && storedExpiry) {
+				const expiry = storedExpiry as number;
+				const now = Date.now();
+
+				if (now < expiry) {
+					ChatSession.globalMCPCapabilitiesCache = storedCapabilities;
+					ChatSession.globalMCPCacheExpiry = expiry;
+					console.log(
+						'🌍 Loaded global MCP capabilities from storage, valid until:',
+						new Date(expiry).toISOString(),
+					);
+				} else {
+					console.log('🕒 Global MCP cache in storage is expired, will refresh on next request');
+				}
+			}
+		} catch (error) {
+			console.error('❌ Failed to load global MCP cache from storage:', error);
+		}
+	}
+
+	private async saveGlobalMCPCacheToStorage(capabilities: any, expiry: number): Promise<void> {
+		try {
+			if (!this.storage) {
+				return;
+			}
+
+			await Promise.all([
+				this.storage.put(this.STORAGE_KEYS.GLOBAL_MCP_CAPABILITIES, capabilities),
+				this.storage.put(this.STORAGE_KEYS.GLOBAL_MCP_CACHE_EXPIRY, expiry),
+			]);
+
+			console.log('💾 Saved global MCP capabilities to storage');
+		} catch (error) {
+			console.error('❌ Failed to save global MCP cache to storage:', error);
+		}
+	}
+
+	// Enhanced User Interaction Handlers
+	private async handleSetUserPreference(sessionId: string, preferenceData: any): Promise<void> {
+		try {
+			const session = this.sessions.get(sessionId);
+			if (!session) {
+				console.warn('Session not found for preference update:', sessionId);
+				return;
+			}
+
+			let userPrefs = this.userPreferences.get(session.userId) || this.getDefaultUserPreferences();
+
+			// Update specific preference fields
+			if (preferenceData.communicationStyle) {
+				userPrefs.communicationStyle = preferenceData.communicationStyle;
+			}
+			if (preferenceData.responseLength) {
+				userPrefs.responseLength = preferenceData.responseLength;
+			}
+			if (preferenceData.defaultTimezone) {
+				userPrefs.defaultTimezone = preferenceData.defaultTimezone;
+			}
+			if (preferenceData.workingHours) {
+				userPrefs.workingHours = preferenceData.workingHours;
+			}
+			if (preferenceData.preferredMeetingDuration) {
+				userPrefs.preferredMeetingDuration = preferenceData.preferredMeetingDuration;
+			}
+			if (preferenceData.emailSignature) {
+				userPrefs.emailSignature = preferenceData.emailSignature;
+			}
+			if (preferenceData.notificationPreferences) {
+				userPrefs.notificationPreferences = preferenceData.notificationPreferences;
+			}
+
+			this.userPreferences.set(session.userId, userPrefs);
+			await this.persistUserPreferencesToStorage();
+
+			console.log('👤 Updated user preferences for user:', session.userId);
+		} catch (error) {
+			console.error('Error setting user preference:', error);
+		}
+	}
+
+	private async handleSetSessionPersonality(sessionId: string, personality: string): Promise<void> {
+		try {
+			this.sessionPersonalities.set(sessionId, personality);
+			await this.persistSessionPersonalitiesToStorage();
+
+			console.log('🎭 Updated session personality for session:', sessionId);
+		} catch (error) {
+			console.error('Error setting session personality:', error);
+		}
+	}
+
+	private async handleSetUserContext(sessionId: string, userContext: any): Promise<void> {
+		try {
+			console.log('🔍 [SET_USER_CONTEXT_DEBUG] Setting user context:');
+			console.log('  - sessionId:', sessionId);
+			console.log('  - userContext received:', userContext);
+			console.log('  - this.workspaceId before:', this.workspaceId);
+
+			const session = this.sessions.get(sessionId);
+			if (session) {
+				console.log('🔍 [SET_USER_CONTEXT_DEBUG] Session found, current values:');
+				console.log('  - session.userId before:', session.userId);
+				console.log('  - session.workspaceId before:', session.workspaceId);
+
+				// Update session with real user information
+				if (userContext.user_id) {
+					session.userId = userContext.user_id;
+					console.log('🔍 [SET_USER_CONTEXT_DEBUG] Updated session.userId to:', session.userId);
+				}
+				if (userContext.workspace_id) {
+					session.workspaceId = userContext.workspace_id;
+					this.workspaceId = userContext.workspace_id;
+					console.log(
+						'🔍 [SET_USER_CONTEXT_DEBUG] Updated session.workspaceId to:',
+						session.workspaceId,
+					);
+					console.log('🔍 [SET_USER_CONTEXT_DEBUG] Updated this.workspaceId to:', this.workspaceId);
+				}
+
+				console.log('👤 Updated session with user context:', {
+					userId: session.userId,
+					workspaceId: session.workspaceId,
+					sessionId: session.id,
+				});
+
+				// Now that we have real user context, load contacts
+				if (userContext.user_id && userContext.workspace_id) {
+					console.log('🔄 Loading contacts now that we have real user context...');
+					await this.loadContactsForSession(sessionId, userContext.workspace_id);
+				}
+			} else {
+				console.log('🔍 [SET_USER_CONTEXT_DEBUG] Session not found for sessionId:', sessionId);
+			}
+		} catch (error) {
+			console.error('Error setting user context:', error);
+		}
+	}
+
+	private getSessionContextData(sessionId: string): any {
+		const session = this.sessions.get(sessionId);
+		if (!session) {
+			return { error: 'Session not found' };
+		}
+
+		const userPrefs = this.userPreferences.get(session.userId);
+		const convContext = this.conversationContext.get(sessionId);
+		const sessionPersonality = this.sessionPersonalities.get(sessionId);
+		const entityContext = this.sessionEntities.get(sessionId);
+
+		return {
+			session: {
+				id: session.id,
+				userId: session.userId,
+				workspaceId: session.workspaceId,
+				isActive: session.isActive,
+				messageCount: session.messages?.length || 0,
+				actionCount: session.actions?.length || 0,
+				lastActivity: session.lastActivity,
+			},
+			userPreferences: userPrefs,
+			conversationContext: convContext,
+			sessionPersonality: sessionPersonality,
+			entityContext: entityContext
+				? {
+						contactCount: entityContext.contacts.length,
+						emailCount: entityContext.emails.length,
+						meetingCount: entityContext.meetings.length,
+						lastUpdated: entityContext.lastUpdated,
+				  }
+				: null,
+			capabilities: {
+				mcpActionsAvailable: ChatSession.globalMCPCapabilitiesCache?.actions?.length || 0,
+				cacheSize: this.mcpResponseCache.size,
+				supportedInteractions: [
+					'interrupt',
+					'pause',
+					'resume',
+					'set_preference',
+					'set_personality',
+					'get_context',
+				],
+			},
+		};
+	}
+}

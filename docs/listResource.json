@@ -1,0 +1,113 @@
+{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+        "resources": [
+            {
+                "name": "calendar",
+                "description": "Comprehensive calendar and meeting management system for scheduling, organizing, and managing all types of events and meetings.",
+                "capabilities": [
+                    {
+                        "name": "meetings",
+                        "description": "Complete meeting and calendar event lifecycle management - create, update, send invites, list, cancel, and manage all calendar events and meetings.",
+                        "actions": [
+                            "meeting_draft_meeting",
+                            "meeting_update_draft",
+                            "meeting_send_invite",
+                            "meeting_list_meetings",
+                            "meeting_cancel_meeting",
+                            "meeting_invite_to_existing"
+                        ]
+                    }
+                ]
+            },
+            {
+                "name": "email",
+                "description": "Workspace email system with drafting, sending, reading, and archiving.",
+                "capabilities": [
+                    {
+                        "name": "compose",
+                        "description": "Draft and send emails.",
+                        "actions": [
+                            "email_draft_email",
+                            "email_send_email"
+                        ]
+                    },
+                    {
+                        "name": "manage",
+                        "description": "Read, archive, and delete emails.",
+                        "actions": [
+                            "email_read_email",
+                            "email_archive_email",
+                            "email_delete_email"
+                        ]
+                    }
+                ]
+            },
+            {
+                "name": "contacts",
+                "description": "Workspace contact management system.",
+                "capabilities": [
+                    {
+                        "name": "search",
+                        "description": "Search and retrieve contacts.",
+                        "actions": [
+                            "contacts_search",
+                            "contacts_get_recent",
+                            "contacts_get_by_company",
+                            "contacts_get_all"
+                        ]
+                    }
+                ]
+            },
+            {
+                "name": "tasks",
+                "description": "Workspace task management system.",
+                "capabilities": [
+                    {
+                        "name": "manage",
+                        "description": "Create, update, and delete tasks.",
+                        "actions": [
+                            "tasks_get_tasks",
+                            "tasks_get_overdue",
+                            "tasks_get_today",
+                            "tasks_create",
+                            "tasks_update",
+                            "tasks_delete",
+                            "tasks_get_summary"
+                        ]
+                    }
+                ]
+            },
+            {
+                "name": "activities",
+                "description": "Workspace activity tracking and analytics.",
+                "capabilities": [
+                    {
+                        "name": "track",
+                        "description": "Track and analyze workspace activities.",
+                        "actions": [
+                            "activities_get_feed",
+                            "activities_get_analytics"
+                        ]
+                    }
+                ]
+            },
+            {
+                "name": "queue",
+                "description": "Background job queue system.",
+                "capabilities": [
+                    {
+                        "name": "manage",
+                        "description": "Queue and manage background jobs.",
+                        "actions": [
+                            "queue_add_job",
+                            "queue_get_status",
+                            "queue_cancel_job"
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+}

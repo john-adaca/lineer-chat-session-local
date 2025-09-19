@@ -1,0 +1,1044 @@
+{
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": [
+        {
+            "name": "email_draft_email",
+            "description": "Draft a new email message",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User creating the draft"
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Email subject line"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Email body content (HTML or plain text)"
+                    },
+                    "to_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        },
+                        "description": "Primary recipients"
+                    },
+                    "cc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        },
+                        "description": "CC recipients"
+                    },
+                    "bcc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        },
+                        "description": "BCC recipients"
+                    },
+                    "reply_to": {
+                        "type": "string",
+                        "format": "email",
+                        "description": "Reply-to email address"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": [
+                            "low",
+                            "normal",
+                            "high"
+                        ],
+                        "description": "Email priority",
+                        "default": "normal"
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "filename": {
+                                    "type": "string"
+                                },
+                                "content_type": {
+                                    "type": "string"
+                                },
+                                "size": {
+                                    "type": "number"
+                                },
+                                "data": {
+                                    "type": "string",
+                                    "description": "Base64 encoded file data"
+                                }
+                            },
+                            "required": [
+                                "filename",
+                                "content_type",
+                                "data"
+                            ]
+                        },
+                        "description": "Email attachments"
+                    },
+                    "template_id": {
+                        "type": "string",
+                        "description": "Email template ID to use"
+                    },
+                    "template_variables": {
+                        "type": "object",
+                        "description": "Variables for template substitution"
+                    },
+                    "scheduled_send": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "When to send the email (if scheduled)"
+                    },
+                    "track_opens": {
+                        "type": "boolean",
+                        "description": "Whether to track email opens",
+                        "default": true
+                    },
+                    "track_clicks": {
+                        "type": "boolean",
+                        "description": "Whether to track link clicks",
+                        "default": true
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "user_id",
+                    "to_emails"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the draft was created successfully"
+                    },
+                    "local_draft_id": {
+                        "type": "string",
+                        "description": "Unique identifier for the local email draft"
+                    },
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email message ID in the database"
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Email subject"
+                    },
+                    "to_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        }
+                    },
+                    "cc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        }
+                    },
+                    "bcc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        }
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "draft",
+                            "sent",
+                            "failed"
+                        ],
+                        "description": "Current status of the email"
+                    },
+                    "created_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "When the draft was created"
+                    },
+                    "updated_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "When the draft was last updated"
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User who created the draft"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Human-readable status message"
+                    }
+                },
+                "required": [
+                    "success",
+                    "local_draft_id",
+                    "email_id",
+                    "subject",
+                    "to_emails",
+                    "status"
+                ]
+            }
+        },
+        {
+            "name": "email_update_draft",
+            "description": "Update an existing email draft",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User updating the draft"
+                    },
+                    "email_id": {
+                        "type": "string",
+                        "description": "ID of the email draft to update"
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Updated email subject"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Updated email body content"
+                    },
+                    "to_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        },
+                        "description": "Updated primary recipients"
+                    },
+                    "cc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        },
+                        "description": "Updated CC recipients"
+                    },
+                    "bcc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        },
+                        "description": "Updated BCC recipients"
+                    },
+                    "reply_to": {
+                        "type": "string",
+                        "format": "email",
+                        "description": "Updated reply-to email address"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": [
+                            "low",
+                            "normal",
+                            "high"
+                        ],
+                        "description": "Updated email priority"
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "filename": {
+                                    "type": "string"
+                                },
+                                "content_type": {
+                                    "type": "string"
+                                },
+                                "size": {
+                                    "type": "number"
+                                },
+                                "data": {
+                                    "type": "string",
+                                    "description": "Base64 encoded file data"
+                                }
+                            },
+                            "required": [
+                                "filename",
+                                "content_type",
+                                "data"
+                            ]
+                        },
+                        "description": "Updated email attachments"
+                    },
+                    "scheduled_send": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "Updated send time (if scheduled)"
+                    },
+                    "track_opens": {
+                        "type": "boolean",
+                        "description": "Whether to track email opens"
+                    },
+                    "track_clicks": {
+                        "type": "boolean",
+                        "description": "Whether to track link clicks"
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "user_id",
+                    "email_id"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the email draft was updated successfully"
+                    },
+                    "email_id": {
+                        "type": "string",
+                        "description": "Unique identifier for the updated email draft"
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Updated email subject"
+                    },
+                    "to_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        }
+                    },
+                    "cc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        }
+                    },
+                    "bcc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        }
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "draft",
+                            "sent",
+                            "failed"
+                        ],
+                        "description": "Current status of the email"
+                    },
+                    "updated_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "When the draft was last updated"
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User who updated the draft"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Human-readable status message"
+                    }
+                },
+                "required": [
+                    "success",
+                    "email_id",
+                    "subject",
+                    "to_emails",
+                    "status"
+                ]
+            }
+        },
+        {
+            "name": "email_send_email",
+            "description": "Send a drafted email message",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User sending the email"
+                    },
+                    "email_id": {
+                        "type": "string",
+                        "description": "ID of the email draft to send"
+                    },
+                    "send_immediately": {
+                        "type": "boolean",
+                        "description": "Whether to send immediately or queue for later",
+                        "default": true
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": [
+                            "low",
+                            "normal",
+                            "high"
+                        ],
+                        "description": "Send priority",
+                        "default": "normal"
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "user_id",
+                    "email_id"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the email was sent successfully"
+                    },
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email message ID"
+                    },
+                    "provider_message_id": {
+                        "type": "string",
+                        "description": "Provider-specific message ID (Gmail, Outlook, etc.)"
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Email subject"
+                    },
+                    "to_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        }
+                    },
+                    "cc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        }
+                    },
+                    "bcc_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        }
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "sent",
+                            "queued",
+                            "failed"
+                        ],
+                        "description": "Send status"
+                    },
+                    "sent_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "When the email was sent"
+                    },
+                    "provider": {
+                        "type": "string",
+                        "enum": [
+                            "gmail",
+                            "outlook",
+                            "smtp"
+                        ],
+                        "description": "Email provider used"
+                    },
+                    "delivery_status": {
+                        "type": "string",
+                        "enum": [
+                            "delivered",
+                            "pending",
+                            "failed",
+                            "bounced"
+                        ],
+                        "description": "Delivery status"
+                    },
+                    "tracking_id": {
+                        "type": "string",
+                        "description": "Tracking ID for opens/clicks"
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User who sent the email"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Human-readable status message"
+                    }
+                },
+                "required": [
+                    "success",
+                    "email_id",
+                    "subject",
+                    "to_emails",
+                    "status"
+                ]
+            }
+        },
+        {
+            "name": "email_read_email",
+            "description": "Read email messages from inbox or specific folder",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User whose emails to read"
+                    },
+                    "folder": {
+                        "type": "string",
+                        "enum": [
+                            "inbox",
+                            "sent",
+                            "drafts",
+                            "trash",
+                            "spam",
+                            "archive"
+                        ],
+                        "description": "Email folder to read from",
+                        "default": "inbox"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of emails to return",
+                        "default": 10
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "Number of emails to skip",
+                        "default": 0
+                    },
+                    "unread_only": {
+                        "type": "boolean",
+                        "description": "Whether to return only unread emails",
+                        "default": false
+                    },
+                    "search_query": {
+                        "type": "string",
+                        "description": "Search query for subject or body"
+                    },
+                    "from_email": {
+                        "type": "string",
+                        "format": "email",
+                        "description": "Filter by sender email"
+                    },
+                    "to_email": {
+                        "type": "string",
+                        "format": "email",
+                        "description": "Filter by recipient email"
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "format": "date",
+                        "description": "Filter emails from this date"
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "format": "date",
+                        "description": "Filter emails to this date"
+                    },
+                    "has_attachments": {
+                        "type": "boolean",
+                        "description": "Whether to filter emails with attachments"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": [
+                            "low",
+                            "normal",
+                            "high"
+                        ],
+                        "description": "Filter by email priority"
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "user_id"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the request was successful"
+                    },
+                    "emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Email message ID"
+                                },
+                                "subject": {
+                                    "type": "string",
+                                    "description": "Email subject"
+                                },
+                                "from": {
+                                    "type": "object",
+                                    "properties": {
+                                        "email": {
+                                            "type": "string",
+                                            "format": "email"
+                                        },
+                                        "name": {
+                                            "type": "string"
+                                        }
+                                    }
+                                },
+                                "to": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "email": {
+                                                "type": "string",
+                                                "format": "email"
+                                            },
+                                            "name": {
+                                                "type": "string"
+                                            }
+                                        }
+                                    }
+                                },
+                                "cc": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "email": {
+                                                "type": "string",
+                                                "format": "email"
+                                            },
+                                            "name": {
+                                                "type": "string"
+                                            }
+                                        }
+                                    }
+                                },
+                                "bcc": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "email": {
+                                                "type": "string",
+                                                "format": "email"
+                                            },
+                                            "name": {
+                                                "type": "string"
+                                            }
+                                        }
+                                    }
+                                },
+                                "body": {
+                                    "type": "string",
+                                    "description": "Email body content"
+                                },
+                                "body_preview": {
+                                    "type": "string",
+                                    "description": "Short preview of email body"
+                                },
+                                "is_read": {
+                                    "type": "boolean",
+                                    "description": "Whether the email has been read"
+                                },
+                                "is_important": {
+                                    "type": "boolean",
+                                    "description": "Whether the email is marked as important"
+                                },
+                                "labels": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    },
+                                    "description": "Email labels/tags"
+                                },
+                                "attachments": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "filename": {
+                                                "type": "string"
+                                            },
+                                            "content_type": {
+                                                "type": "string"
+                                            },
+                                            "size": {
+                                                "type": "number"
+                                            },
+                                            "download_url": {
+                                                "type": "string"
+                                            }
+                                        }
+                                    }
+                                },
+                                "priority": {
+                                    "type": "string",
+                                    "enum": [
+                                        "low",
+                                        "normal",
+                                        "high"
+                                    ]
+                                },
+                                "received_at": {
+                                    "type": "string",
+                                    "format": "date-time",
+                                    "description": "When the email was received"
+                                },
+                                "created_at": {
+                                    "type": "string",
+                                    "format": "date-time",
+                                    "description": "When the email was created"
+                                },
+                                "updated_at": {
+                                    "type": "string",
+                                    "format": "date-time",
+                                    "description": "When the email was last updated"
+                                },
+                                "thread_id": {
+                                    "type": "string",
+                                    "description": "Email thread ID"
+                                },
+                                "provider_message_id": {
+                                    "type": "string",
+                                    "description": "Provider-specific message ID"
+                                }
+                            }
+                        }
+                    },
+                    "total": {
+                        "type": "number",
+                        "description": "Total number of emails found"
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": "Folder that was searched"
+                    },
+                    "filters": {
+                        "type": "object",
+                        "properties": {
+                            "unread_only": {
+                                "type": "boolean"
+                            },
+                            "search_query": {
+                                "type": "string"
+                            },
+                            "from_email": {
+                                "type": "string",
+                                "format": "email"
+                            },
+                            "to_email": {
+                                "type": "string",
+                                "format": "email"
+                            },
+                            "date_from": {
+                                "type": "string",
+                                "format": "date"
+                            },
+                            "date_to": {
+                                "type": "string",
+                                "format": "date"
+                            },
+                            "has_attachments": {
+                                "type": "boolean"
+                            },
+                            "priority": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "pagination": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "number"
+                            },
+                            "offset": {
+                                "type": "number"
+                            },
+                            "has_more": {
+                                "type": "boolean"
+                            }
+                        }
+                    }
+                },
+                "required": [
+                    "success",
+                    "emails",
+                    "total",
+                    "folder"
+                ]
+            }
+        },
+        {
+            "name": "email_archive_email",
+            "description": "Archive email messages",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User archiving the emails"
+                    },
+                    "email_ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "IDs of emails to archive"
+                    },
+                    "bulk_archive": {
+                        "type": "boolean",
+                        "description": "Whether to archive multiple emails at once",
+                        "default": false
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "user_id",
+                    "email_ids"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the archiving was successful"
+                    },
+                    "archived_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "email_id": {
+                                    "type": "string"
+                                },
+                                "subject": {
+                                    "type": "string"
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": [
+                                        "archived",
+                                        "failed"
+                                    ]
+                                },
+                                "error": {
+                                    "type": "string",
+                                    "description": "Error message if failed"
+                                }
+                            }
+                        }
+                    },
+                    "total_archived": {
+                        "type": "number",
+                        "description": "Number of emails successfully archived"
+                    },
+                    "total_failed": {
+                        "type": "number",
+                        "description": "Number of emails that failed to archive"
+                    },
+                    "archived_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "When the archiving was performed"
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User who archived the emails"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Human-readable status message"
+                    }
+                },
+                "required": [
+                    "success",
+                    "archived_emails",
+                    "total_archived",
+                    "total_failed"
+                ]
+            }
+        },
+        {
+            "name": "email_delete_email",
+            "description": "Delete email messages permanently",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User deleting the emails"
+                    },
+                    "email_ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "IDs of emails to delete"
+                    },
+                    "permanent_delete": {
+                        "type": "boolean",
+                        "description": "Whether to permanently delete (vs move to trash)",
+                        "default": false
+                    },
+                    "bulk_delete": {
+                        "type": "boolean",
+                        "description": "Whether to delete multiple emails at once",
+                        "default": false
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "user_id",
+                    "email_ids"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the deletion was successful"
+                    },
+                    "deleted_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "email_id": {
+                                    "type": "string"
+                                },
+                                "subject": {
+                                    "type": "string"
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": [
+                                        "deleted",
+                                        "moved_to_trash",
+                                        "failed"
+                                    ]
+                                },
+                                "error": {
+                                    "type": "string",
+                                    "description": "Error message if failed"
+                                }
+                            }
+                        }
+                    },
+                    "total_deleted": {
+                        "type": "number",
+                        "description": "Number of emails successfully deleted"
+                    },
+                    "total_failed": {
+                        "type": "number",
+                        "description": "Number of emails that failed to delete"
+                    },
+                    "deletion_type": {
+                        "type": "string",
+                        "enum": [
+                            "permanent",
+                            "trash"
+                        ],
+                        "description": "Type of deletion performed"
+                    },
+                    "deleted_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "When the deletion was performed"
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User who deleted the emails"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Human-readable status message"
+                    }
+                },
+                "required": [
+                    "success",
+                    "deleted_emails",
+                    "total_deleted",
+                    "total_failed",
+                    "deletion_type"
+                ]
+            }
+        }
+    ]
+}

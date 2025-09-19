@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChatSession WebSocket Test</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+
+        .container {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .status {
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .status.connecting {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+
+        .form-group {
+            margin: 15px 0;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+
+        input, select, textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 5px;
+            transition: background-color 0.3s;
+        }
+
+        button:hover {
+            background-color: #0056b3;
+        }
+
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+
+        .message-input {
+            display: flex;
+            gap: 10px;
+            margin: 15px 0;
+        }
+
+        .message-input input {
+            flex: 1;
+        }
+
+        .messages {
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            height: 300px;
+            overflow-y: auto;
+            padding: 10px;
+            background-color: #fafafa;
+            margin: 15px 0;
+        }
+
+        .message {
+            margin: 5px 0;
+            padding: 8px;
+            border-radius: 5px;
+            word-wrap: break-word;
+        }
+
+        .message.sent {
+            background-color: #007bff;
+            color: white;
+            text-align: right;
+        }
+
+        .message.received {
+            background-color: #e9ecef;
+            color: #333;
+        }
+
+        .message.system {
+            background-color: #fff3cd;
+            color: #856404;
+            font-style: italic;
+            text-align: center;
+        }
+
+        .test-buttons {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        .test-section {
+            border: 1px solid #eee;
+            border-radius: 5px;
+            padding: 15px;
+            margin: 15px 0;
+        }
+
+        .test-section h3 {
+            margin-top: 0;
+            color: #666;
+        }
+
+        .json-output {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔌 ChatSession WebSocket Test</h1>
+
+        <!-- Connection Status -->
+        <div id="status" class="status disconnected">
+            Disconnected
+        </div>
+
+        <!-- Connection Form -->
+        <div class="test-section">
+            <h3>🔗 Connection Settings</h3>
+            <div class="form-group">
+                <label for="userId">User ID:</label>
+                <input type="text" id="userId" value="330c7620-2914-4a5c-8d5f-e4bac4737d08" placeholder="Enter user ID">
+            </div>
+            <div class="form-group">
+                <label for="workspaceId">Workspace ID:</label>
+                <input type="text" id="workspaceId" value="14f49f8a-1e2f-4159-abf9-bbff0078bfa9" placeholder="Enter workspace ID">
+            </div>
+            <div class="form-group">
+                <label for="sessionId">Session ID:</label>
+                <input type="text" id="sessionId" value="f279177d-2e8e-48ad-baa4-607f440f7950" placeholder="Your actual session ID" readonly>
+                <small style="color: #666; font-size: 12px;">This is your real session ID from the chat/UI</small>
+            </div>
+            <button id="connectBtn" onclick="connect()">Connect WebSocket</button>
+            <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        </div>
+
+        <!-- Messages -->
+        <div class="test-section">
+            <h3>💬 Messages</h3>
+            <div id="messages" class="messages"></div>
+
+            <div class="message-input">
+                <input type="text" id="messageInput" placeholder="Type a message..." onkeypress="handleKeyPress(event)">
+                <button onclick="sendMessage()">Send Message</button>
+            </div>
+        </div>
+
+        <!-- Test Buttons -->
+        <div class="test-section">
+            <h3>🧪 Quick Tests</h3>
+            <div class="test-buttons">
+                <button onclick="testStatus()">Send Status</button>
+                <button onclick="testPreference()">Set Preference</button>
+                <button onclick="testPersonality()">Set Personality</button>
+                <button onclick="testContext()">Set Context</button>
+                <button onclick="testGetContext()">Get Context</button>
+                <button onclick="testInterrupt()">Send Interrupt</button>
+                <button onclick="testMCPCache()">Test MCP Cache</button>
+                <button onclick="testMCPAccumulation()">📇 Test Contact Search</button>
+                <button onclick="testEmailAccumulation()">📧 Test Email Draft</button>
+                <button onclick="testMeetingAccumulation()">📅 Test Meeting Draft</button>
+                <button onclick="testSessionSummary()">📊 Get Session Summary</button>
+                <button onclick="runFullTest()" style="background-color: #28a745; margin-top: 10px;">🚀 Run Full Test Suite</button>
+            </div>
+        </div>
+
+        <!-- Raw JSON Output -->
+        <div class="test-section">
+            <h3>📄 Raw JSON Output</h3>
+            <div id="jsonOutput" class="json-output">No messages received yet...</div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let messageCounter = 1;
+
+        function updateStatus(message, type = 'disconnected') {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.className = `status ${type}`;
+        }
+
+        function addMessage(content, type = 'received', rawData = null) {
+            const messagesEl = document.getElementById('messages');
+            const messageEl = document.createElement('div');
+            messageEl.className = `message ${type}`;
+            messageEl.textContent = content;
+            messagesEl.appendChild(messageEl);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+
+            // Update JSON output
+            if (rawData) {
+                document.getElementById('jsonOutput').textContent = JSON.stringify(rawData, null, 2);
+            }
+        }
+
+        function connect() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                addMessage('Already connected!', 'system');
+                return;
+            }
+
+            const userId = document.getElementById('userId').value;
+            const workspaceId = document.getElementById('workspaceId').value;
+
+            if (!userId || !workspaceId) {
+                alert('Please enter User ID and Workspace ID');
+                return;
+            }
+
+            updateStatus('Connecting...', 'connecting');
+
+            const wsUrl = `ws://127.0.0.1:8787/?userId=${encodeURIComponent(userId)}&workspaceId=${encodeURIComponent(workspaceId)}`;
+
+            try {
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = function(event) {
+                    updateStatus('Connected to ChatSession', 'connected');
+                    addMessage('WebSocket connected successfully!', 'system');
+                    document.getElementById('connectBtn').disabled = true;
+                    document.getElementById('disconnectBtn').disabled = false;
+                };
+
+                ws.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        addMessage(`Received: ${data.type} - ${data.content || 'No content'}`, 'received', data);
+                    } catch (error) {
+                        addMessage(`Received: ${event.data}`, 'received');
+                    }
+                };
+
+                ws.onclose = function(event) {
+                    updateStatus('Disconnected', 'disconnected');
+                    addMessage(`WebSocket closed: ${event.code} ${event.reason}`, 'system');
+                    document.getElementById('connectBtn').disabled = false;
+                    document.getElementById('disconnectBtn').disabled = true;
+                };
+
+                ws.onerror = function(error) {
+                    updateStatus('Connection Error', 'disconnected');
+                    addMessage('WebSocket error occurred', 'system');
+                    console.error('WebSocket error:', error);
+                };
+
+            } catch (error) {
+                updateStatus('Connection Failed', 'disconnected');
+                addMessage(`Failed to connect: ${error.message}`, 'system');
+            }
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+            }
+        }
+
+        function sendMessage() {
+            const messageInput = document.getElementById('messageInput');
+            const content = messageInput.value.trim();
+            const sessionId = document.getElementById('sessionId').value;
+
+            if (!content) {
+                alert('Please enter a message');
+                return;
+            }
+
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const message = {
+                type: 'message',
+                content: content,
+                sessionId: sessionId,
+                messageId: `msg-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage(`Sent: ${content}`, 'sent');
+            messageInput.value = '';
+        }
+
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+
+        function testStatus() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const message = {
+                type: 'status',
+                content: 'Test status message from browser',
+                messageId: `status-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Sent status message', 'sent');
+        }
+
+        function testPreference() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const sessionId = document.getElementById('sessionId').value;
+            const message = {
+                type: 'set_preference',
+                data: {
+                    communicationStyle: 'casual',
+                    responseLength: 'brief',
+                    defaultTimezone: 'UTC',
+                    workingHours: { start: '09:00', end: '17:00' }
+                },
+                sessionId: sessionId,
+                messageId: `pref-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Sent preference update', 'sent');
+        }
+
+        function testPersonality() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const sessionId = document.getElementById('sessionId').value;
+            const message = {
+                type: 'set_personality',
+                data: {
+                    personality: {
+                        id: 'friendly-assistant',
+                        name: 'Friendly Assistant',
+                        systemPrompt: 'You are a friendly and helpful AI assistant.'
+                    }
+                },
+                sessionId: sessionId,
+                messageId: `personality-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Sent personality update', 'sent');
+        }
+
+        function testContext() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const sessionId = document.getElementById('sessionId').value;
+            const message = {
+                type: 'set_user_context',
+                data: {
+                    userGoals: ['Test the chat system', 'Learn about WebSockets'],
+                    currentTasks: ['Running automated tests'],
+                    emotionalTone: 'curious',
+                    conversationFlow: ['greeting', 'testing', 'feedback']
+                },
+                sessionId: sessionId,
+                messageId: `context-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Sent context update', 'sent');
+        }
+
+        function testGetContext() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const sessionId = document.getElementById('sessionId').value;
+            const message = {
+                type: 'get_context',
+                sessionId: sessionId,
+                messageId: `get-context-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Requested context data', 'sent');
+        }
+
+        function testInterrupt() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const message = {
+                type: 'interrupt',
+                messageId: `interrupt-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Sent interrupt signal', 'sent');
+        }
+
+        function testMCPAccumulation() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            // Simulate MCP response accumulation with realistic data
+            const message = {
+                type: 'accumulate_mcp_response',
+                data: {
+                    action: 'contacts_search',
+                    parameters: {
+                        query: 'john@example.com',
+                        limit: 10,
+                        workspace_id: document.getElementById('workspaceId').value
+                    },
+                    result: [
+                        {
+                            id: 'contact-123',
+                            name: 'John Doe',
+                            email: 'john@example.com',
+                            company: 'Tech Corp',
+                            last_contact: '2024-01-15T10:30:00Z'
+                        },
+                        {
+                            id: 'contact-456',
+                            name: 'John Smith',
+                            email: 'john.smith@example.com',
+                            company: 'Dev Solutions',
+                            last_contact: '2024-01-10T14:20:00Z'
+                        }
+                    ],
+                    success: true,
+                    metadata: {
+                        total_results: 2,
+                        search_time: 0.15,
+                        source: 'workspace_contacts'
+                    }
+                },
+                sessionId: document.getElementById('sessionId').value,
+                messageId: `mcp-accumulate-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Testing MCP contact search accumulation', 'sent');
+        }
+
+        function testEmailAccumulation() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const message = {
+                type: 'accumulate_mcp_response',
+                data: {
+                    action: 'email_draft_email',
+                    parameters: {
+                        to: ['john@example.com'],
+                        subject: 'Project Update',
+                        body: 'Here is the latest update on our project...'
+                    },
+                    result: {
+                        id: 'email-draft-789',
+                        status: 'draft',
+                        draft_url: 'https://workspace.com/drafts/789',
+                        estimated_send_time: '2024-01-16T09:00:00Z'
+                    },
+                    success: true
+                },
+                sessionId: document.getElementById('sessionId').value,
+                messageId: `mcp-email-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Testing MCP email draft accumulation', 'sent');
+        }
+
+        function testMeetingAccumulation() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const message = {
+                type: 'accumulate_mcp_response',
+                data: {
+                    action: 'meeting_draft_meeting',
+                    parameters: {
+                        title: 'Project Review Meeting',
+                        attendees: ['john@example.com', 'jane@company.com'],
+                        start_time: '2024-01-20T14:00:00Z',
+                        duration: 60
+                    },
+                    result: {
+                        id: 'meeting-101',
+                        title: 'Project Review Meeting',
+                        status: 'draft',
+                        meeting_url: 'https://workspace.com/meetings/101',
+                        calendar_invite_sent: false
+                    },
+                    success: true
+                },
+                sessionId: document.getElementById('sessionId').value,
+                messageId: `mcp-meeting-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Testing MCP meeting draft accumulation', 'sent');
+        }
+
+        function testSessionSummary() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const message = {
+                type: 'get_session_summary',
+                sessionId: document.getElementById('sessionId').value,
+                messageId: `summary-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Requested session summary', 'sent');
+        }
+
+        function testMCPCache() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('WebSocket is not connected');
+                return;
+            }
+
+            const message = {
+                type: 'test_mcp_cache',
+                messageId: `mcp-cache-${messageCounter++}`
+            };
+
+            ws.send(JSON.stringify(message));
+            addMessage('Testing MCP global cache...', 'sent');
+        }
+
+        async function runFullTest() {
+            addMessage('🚀 Starting Full Test Suite...', 'system');
+
+            // Step 1: Connect
+            addMessage('Step 1: Connecting WebSocket...', 'system');
+            connect();
+
+            // Wait for connection
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Step 2: Test MCP Cache (should fetch fresh)
+            addMessage('Step 2: Testing MCP Cache (fresh fetch)...', 'system');
+            testMCPCache();
+
+            // Wait for response
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
+            // Step 3: Disconnect
+            addMessage('Step 3: Disconnecting WebSocket...', 'system');
+            disconnect();
+
+            // Wait for disconnect
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Step 4: Reconnect
+            addMessage('Step 4: Reconnecting WebSocket...', 'system');
+            connect();
+
+            // Wait for connection
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Step 5: Test MCP Cache again (should use cache)
+            addMessage('Step 5: Testing MCP Cache (should use cache)...', 'system');
+            testMCPCache();
+
+            // Wait for response
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
+            addMessage('✅ Full Test Suite Complete!', 'system');
+            addMessage('Check the results above to verify MCP caching is working correctly.', 'system');
+        }
+
+        // Auto-connect on page load (optional)
+        window.addEventListener('load', function() {
+            addMessage('Welcome to ChatSession WebSocket Test!', 'system');
+            addMessage('Click "Connect WebSocket" to start testing.', 'system');
+        });
+    </script>
+</body>
+</html>

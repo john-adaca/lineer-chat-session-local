@@ -1,0 +1,949 @@
+{
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": [
+        {
+            "name": "contacts_search",
+            "description": "Search for contacts in the workspace",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (name, email, company, phone)"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Optional user filter"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of contacts to return",
+                        "default": 10
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "Number of contacts to skip",
+                        "default": 0
+                    },
+                    "search_fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "name",
+                                "email",
+                                "company",
+                                "phone",
+                                "title",
+                                "notes"
+                            ]
+                        },
+                        "description": "Fields to search in",
+                        "default": [
+                            "name",
+                            "email",
+                            "company"
+                        ]
+                    },
+                    "exact_match": {
+                        "type": "boolean",
+                        "description": "Whether to require exact matches",
+                        "default": false
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "Whether search is case sensitive",
+                        "default": false
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "query"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the search was successful"
+                    },
+                    "contacts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Contact ID"
+                                },
+                                "name": {
+                                    "type": "string",
+                                    "description": "Contact name"
+                                },
+                                "email": {
+                                    "type": "string",
+                                    "format": "email",
+                                    "description": "Primary email address"
+                                },
+                                "emails": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "email": {
+                                                "type": "string",
+                                                "format": "email"
+                                            },
+                                            "type": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "primary",
+                                                    "work",
+                                                    "personal",
+                                                    "other"
+                                                ]
+                                            },
+                                            "is_primary": {
+                                                "type": "boolean"
+                                            }
+                                        }
+                                    },
+                                    "description": "All email addresses"
+                                },
+                                "phone": {
+                                    "type": "string",
+                                    "description": "Primary phone number"
+                                },
+                                "phones": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "phone": {
+                                                "type": "string"
+                                            },
+                                            "type": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "mobile",
+                                                    "work",
+                                                    "home",
+                                                    "fax",
+                                                    "other"
+                                                ]
+                                            },
+                                            "is_primary": {
+                                                "type": "boolean"
+                                            }
+                                        }
+                                    },
+                                    "description": "All phone numbers"
+                                },
+                                "company": {
+                                    "type": "string",
+                                    "description": "Company name"
+                                },
+                                "title": {
+                                    "type": "string",
+                                    "description": "Job title"
+                                },
+                                "department": {
+                                    "type": "string",
+                                    "description": "Department"
+                                },
+                                "address": {
+                                    "type": "object",
+                                    "properties": {
+                                        "street": {
+                                            "type": "string"
+                                        },
+                                        "city": {
+                                            "type": "string"
+                                        },
+                                        "state": {
+                                            "type": "string"
+                                        },
+                                        "zip": {
+                                            "type": "string"
+                                        },
+                                        "country": {
+                                            "type": "string"
+                                        }
+                                    },
+                                    "description": "Address information"
+                                },
+                                "website": {
+                                    "type": "string",
+                                    "format": "uri",
+                                    "description": "Website URL"
+                                },
+                                "linkedin": {
+                                    "type": "string",
+                                    "description": "LinkedIn profile"
+                                },
+                                "twitter": {
+                                    "type": "string",
+                                    "description": "Twitter handle"
+                                },
+                                "notes": {
+                                    "type": "string",
+                                    "description": "Contact notes"
+                                },
+                                "tags": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    },
+                                    "description": "Contact tags"
+                                },
+                                "source": {
+                                    "type": "string",
+                                    "enum": [
+                                        "manual",
+                                        "import",
+                                        "integration",
+                                        "api"
+                                    ],
+                                    "description": "How the contact was added"
+                                },
+                                "last_contacted": {
+                                    "type": "string",
+                                    "format": "date-time",
+                                    "description": "When last contacted"
+                                },
+                                "created_at": {
+                                    "type": "string",
+                                    "format": "date-time",
+                                    "description": "When the contact was created"
+                                },
+                                "updated_at": {
+                                    "type": "string",
+                                    "format": "date-time",
+                                    "description": "When the contact was last updated"
+                                },
+                                "relevance_score": {
+                                    "type": "number",
+                                    "description": "Search relevance score (0-1)"
+                                }
+                            }
+                        }
+                    },
+                    "total": {
+                        "type": "number",
+                        "description": "Total number of contacts found"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query used"
+                    },
+                    "search_fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Fields that were searched"
+                    },
+                    "pagination": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "number"
+                            },
+                            "offset": {
+                                "type": "number"
+                            },
+                            "has_more": {
+                                "type": "boolean"
+                            }
+                        }
+                    }
+                },
+                "required": [
+                    "success",
+                    "contacts",
+                    "total",
+                    "query"
+                ]
+            }
+        },
+        {
+            "name": "contacts_get_recent",
+            "description": "Get recently added or updated contacts",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Optional user filter"
+                    },
+                    "days": {
+                        "type": "number",
+                        "description": "Number of days to look back",
+                        "default": 30
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of contacts to return",
+                        "default": 10
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": [
+                            "created_at",
+                            "updated_at",
+                            "last_contacted"
+                        ],
+                        "description": "Field to sort by",
+                        "default": "created_at"
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "enum": [
+                            "asc",
+                            "desc"
+                        ],
+                        "description": "Sort order",
+                        "default": "desc"
+                    },
+                    "include_contacted": {
+                        "type": "boolean",
+                        "description": "Whether to include recently contacted contacts",
+                        "default": true
+                    }
+                },
+                "required": [
+                    "workspace_id"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the request was successful"
+                    },
+                    "contacts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string"
+                                },
+                                "name": {
+                                    "type": "string"
+                                },
+                                "email": {
+                                    "type": "string",
+                                    "format": "email"
+                                },
+                                "phone": {
+                                    "type": "string"
+                                },
+                                "company": {
+                                    "type": "string"
+                                },
+                                "title": {
+                                    "type": "string"
+                                },
+                                "department": {
+                                    "type": "string"
+                                },
+                                "website": {
+                                    "type": "string",
+                                    "format": "uri"
+                                },
+                                "linkedin": {
+                                    "type": "string"
+                                },
+                                "twitter": {
+                                    "type": "string"
+                                },
+                                "notes": {
+                                    "type": "string"
+                                },
+                                "tags": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    }
+                                },
+                                "source": {
+                                    "type": "string",
+                                    "enum": [
+                                        "manual",
+                                        "import",
+                                        "integration",
+                                        "api"
+                                    ]
+                                },
+                                "last_contacted": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                },
+                                "created_at": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                },
+                                "updated_at": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                },
+                                "contact_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "new",
+                                        "updated",
+                                        "contacted"
+                                    ],
+                                    "description": "Type of recent activity"
+                                }
+                            }
+                        }
+                    },
+                    "total": {
+                        "type": "number",
+                        "description": "Total number of contacts found"
+                    },
+                    "days": {
+                        "type": "number",
+                        "description": "Number of days searched"
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Field sorted by"
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "description": "Sort order used"
+                    },
+                    "summary": {
+                        "type": "object",
+                        "properties": {
+                            "new_contacts": {
+                                "type": "number"
+                            },
+                            "updated_contacts": {
+                                "type": "number"
+                            },
+                            "contacted_contacts": {
+                                "type": "number"
+                            }
+                        }
+                    }
+                },
+                "required": [
+                    "success",
+                    "contacts",
+                    "total",
+                    "days"
+                ]
+            }
+        },
+        {
+            "name": "contacts_get_by_company",
+            "description": "Get contacts filtered by company",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "company_name": {
+                        "type": "string",
+                        "description": "Company name to filter by"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Optional user filter"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of contacts to return",
+                        "default": 10
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "Number of contacts to skip",
+                        "default": 0
+                    },
+                    "exact_match": {
+                        "type": "boolean",
+                        "description": "Whether to require exact company name match",
+                        "default": false
+                    },
+                    "include_similar": {
+                        "type": "boolean",
+                        "description": "Whether to include similar company names",
+                        "default": true
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": [
+                            "name",
+                            "title",
+                            "created_at",
+                            "last_contacted"
+                        ],
+                        "description": "Field to sort by",
+                        "default": "name"
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "enum": [
+                            "asc",
+                            "desc"
+                        ],
+                        "description": "Sort order",
+                        "default": "asc"
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "company_name"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the request was successful"
+                    },
+                    "contacts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string"
+                                },
+                                "name": {
+                                    "type": "string"
+                                },
+                                "email": {
+                                    "type": "string",
+                                    "format": "email"
+                                },
+                                "phone": {
+                                    "type": "string"
+                                },
+                                "company": {
+                                    "type": "string"
+                                },
+                                "title": {
+                                    "type": "string"
+                                },
+                                "department": {
+                                    "type": "string"
+                                },
+                                "website": {
+                                    "type": "string",
+                                    "format": "uri"
+                                },
+                                "linkedin": {
+                                    "type": "string"
+                                },
+                                "twitter": {
+                                    "type": "string"
+                                },
+                                "notes": {
+                                    "type": "string"
+                                },
+                                "tags": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    }
+                                },
+                                "source": {
+                                    "type": "string",
+                                    "enum": [
+                                        "manual",
+                                        "import",
+                                        "integration",
+                                        "api"
+                                    ]
+                                },
+                                "last_contacted": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                },
+                                "created_at": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                },
+                                "updated_at": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                }
+                            }
+                        }
+                    },
+                    "total": {
+                        "type": "number",
+                        "description": "Total number of contacts found"
+                    },
+                    "company": {
+                        "type": "string",
+                        "description": "Company name searched"
+                    },
+                    "company_info": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string"
+                            },
+                            "website": {
+                                "type": "string",
+                                "format": "uri"
+                            },
+                            "industry": {
+                                "type": "string"
+                            },
+                            "size": {
+                                "type": "string",
+                                "enum": [
+                                    "startup",
+                                    "small",
+                                    "medium",
+                                    "large",
+                                    "enterprise"
+                                ]
+                            },
+                            "location": {
+                                "type": "string"
+                            },
+                            "description": {
+                                "type": "string"
+                            }
+                        },
+                        "description": "Additional company information if available"
+                    },
+                    "pagination": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "number"
+                            },
+                            "offset": {
+                                "type": "number"
+                            },
+                            "has_more": {
+                                "type": "boolean"
+                            }
+                        }
+                    },
+                    "summary": {
+                        "type": "object",
+                        "properties": {
+                            "total_contacts": {
+                                "type": "number"
+                            },
+                            "departments": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "department": {
+                                            "type": "string"
+                                        },
+                                        "count": {
+                                            "type": "number"
+                                        }
+                                    }
+                                }
+                            },
+                            "titles": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "title": {
+                                            "type": "string"
+                                        },
+                                        "count": {
+                                            "type": "number"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "required": [
+                    "success",
+                    "contacts",
+                    "total",
+                    "company"
+                ]
+            }
+        },
+        {
+            "name": "contacts_get_all",
+            "description": "Get all contacts in the workspace",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace identifier"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Optional user filter"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of contacts to return",
+                        "default": 50
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "Number of contacts to skip",
+                        "default": 0
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": [
+                            "name",
+                            "email",
+                            "company",
+                            "created_at",
+                            "updated_at",
+                            "last_contacted"
+                        ],
+                        "description": "Field to sort by",
+                        "default": "created_at"
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "enum": [
+                            "asc",
+                            "desc"
+                        ],
+                        "description": "Sort order",
+                        "default": "desc"
+                    },
+                    "include_inactive": {
+                        "type": "boolean",
+                        "description": "Whether to include inactive contacts",
+                        "default": false
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Filter by contact tags"
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": [
+                            "manual",
+                            "import",
+                            "integration",
+                            "api"
+                        ],
+                        "description": "Filter by contact source"
+                    }
+                },
+                "required": [
+                    "workspace_id"
+                ]
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {
+                        "type": "boolean",
+                        "description": "Whether the request was successful"
+                    },
+                    "contacts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string"
+                                },
+                                "name": {
+                                    "type": "string"
+                                },
+                                "email": {
+                                    "type": "string",
+                                    "format": "email"
+                                },
+                                "phone": {
+                                    "type": "string"
+                                },
+                                "company": {
+                                    "type": "string"
+                                },
+                                "title": {
+                                    "type": "string"
+                                },
+                                "department": {
+                                    "type": "string"
+                                },
+                                "website": {
+                                    "type": "string",
+                                    "format": "uri"
+                                },
+                                "linkedin": {
+                                    "type": "string"
+                                },
+                                "twitter": {
+                                    "type": "string"
+                                },
+                                "notes": {
+                                    "type": "string"
+                                },
+                                "tags": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    }
+                                },
+                                "source": {
+                                    "type": "string",
+                                    "enum": [
+                                        "manual",
+                                        "import",
+                                        "integration",
+                                        "api"
+                                    ]
+                                },
+                                "last_contacted": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                },
+                                "created_at": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                },
+                                "updated_at": {
+                                    "type": "string",
+                                    "format": "date-time"
+                                },
+                                "is_active": {
+                                    "type": "boolean",
+                                    "description": "Whether the contact is active"
+                                }
+                            }
+                        }
+                    },
+                    "total": {
+                        "type": "number",
+                        "description": "Total number of contacts found"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Limit applied"
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Field sorted by"
+                    },
+                    "sort_order": {
+                        "type": "string",
+                        "description": "Sort order used"
+                    },
+                    "pagination": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "number"
+                            },
+                            "offset": {
+                                "type": "number"
+                            },
+                            "has_more": {
+                                "type": "boolean"
+                            },
+                            "total_pages": {
+                                "type": "number"
+                            },
+                            "current_page": {
+                                "type": "number"
+                            }
+                        }
+                    },
+                    "summary": {
+                        "type": "object",
+                        "properties": {
+                            "total_contacts": {
+                                "type": "number"
+                            },
+                            "active_contacts": {
+                                "type": "number"
+                            },
+                            "inactive_contacts": {
+                                "type": "number"
+                            },
+                            "companies": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "company": {
+                                            "type": "string"
+                                        },
+                                        "count": {
+                                            "type": "number"
+                                        }
+                                    }
+                                }
+                            },
+                            "sources": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "source": {
+                                            "type": "string"
+                                        },
+                                        "count": {
+                                            "type": "number"
+                                        }
+                                    }
+                                }
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "tag": {
+                                            "type": "string"
+                                        },
+                                        "count": {
+                                            "type": "number"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "required": [
+                    "success",
+                    "contacts",
+                    "total",
+                    "limit"
+                ]
+            }
+        }
+    ]
+}

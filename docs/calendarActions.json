@@ -1,0 +1,313 @@
+{
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": [
+        {
+            "name": "calendar_draft_event",
+            "description": "Draft a calendar event/meeting. Creates a draft in the system that can be edited before sending invites. No calendar invites or emails are sent yet.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "The workspace ID where the meeting will be created"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "The user ID creating the meeting"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "The meeting title/subject"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional meeting description or agenda"
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "The meeting start time in ISO 8601 format"
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "The meeting end time in ISO 8601 format"
+                    },
+                    "location": {
+                        "type": "string",
+                        "description": "Optional meeting location (physical or virtual)"
+                    },
+                    "attendee_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Array of attendee email addresses or contact IDs. If contact ID is provided, the system will look up the email address from the contacts table."
+                    },
+                    "attendee_names": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Array of attendee names (optional, should match attendee_emails order). If not provided and contact ID is used, names will be looked up from contacts."
+                    },
+                    "meeting_link": {
+                        "type": "string",
+                        "description": "Optional meeting link (Zoom, Teams, etc.)"
+                    },
+                    "is_all_day": {
+                        "type": "boolean",
+                        "description": "Whether this is an all-day meeting",
+                        "default": false
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "user_id",
+                    "title",
+                    "start_time",
+                    "end_time"
+                ]
+            }
+        },
+        {
+            "name": "calendar_update_draft",
+            "description": "Update a drafted calendar event/meeting. Only works on events that haven't been sent yet. Modifies the draft in the system.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "meeting_id": {
+                        "type": "string",
+                        "description": "The ID of the meeting to update"
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "The workspace ID of the meeting"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "The user ID updating the meeting"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Updated meeting title/subject"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Updated meeting description or agenda"
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "Updated meeting start time in ISO 8601 format"
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "Updated meeting end time in ISO 8601 format"
+                    },
+                    "location": {
+                        "type": "string",
+                        "description": "Updated meeting location"
+                    },
+                    "attendee_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        },
+                        "description": "Updated array of attendee email addresses"
+                    },
+                    "attendee_names": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Updated array of attendee names"
+                    },
+                    "meeting_link": {
+                        "type": "string",
+                        "description": "Updated meeting link"
+                    },
+                    "is_all_day": {
+                        "type": "boolean",
+                        "description": "Updated all-day status"
+                    }
+                },
+                "required": [
+                    "meeting_id"
+                ]
+            }
+        },
+        {
+            "name": "calendar_send_event",
+            "description": "Send a drafted calendar event. Creates the event in Google Calendar and sends email invites to all attendees. Use this after drafting an event.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "meeting_id": {
+                        "type": "string",
+                        "description": "The ID of the meeting to send invites for"
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "The workspace ID of the meeting"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "The user ID sending the invites"
+                    }
+                },
+                "required": [
+                    "meeting_id",
+                    "workspace_id",
+                    "user_id"
+                ]
+            }
+        },
+        {
+            "name": "calendar_list_events",
+            "description": "List calendar events/meetings. Use this when users ask to 'check my calendar', 'show my schedule', or 'what meetings do I have'. Supports filtering by date range, status, etc.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "The workspace ID to list meetings for"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "The user ID to list meetings for"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of meetings to return",
+                        "default": 50
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Number of meetings to skip for pagination",
+                        "default": 0
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "all",
+                            "upcoming",
+                            "past",
+                            "draft",
+                            "sent"
+                        ],
+                        "description": "Filter meetings by status",
+                        "default": "all"
+                    },
+                    "days_back": {
+                        "type": "integer",
+                        "description": "Number of days to look back from today (e.g., 7 for last week)",
+                        "minimum": 1
+                    },
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "Number of days to look ahead from today (e.g., 30 for next month)",
+                        "minimum": 1
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "Specific start date for filtering (ISO 8601 format)"
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "Specific end date for filtering (ISO 8601 format)"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Search in meeting title, description, or location (fuzzy matching, case-insensitive)"
+                    },
+                    "search_attendee": {
+                        "type": "string",
+                        "description": "Search for meetings with specific attendee name or email (fuzzy matching)"
+                    },
+                    "search_cc": {
+                        "type": "string",
+                        "description": "Search for meetings with specific CC recipient email (fuzzy matching)"
+                    }
+                },
+                "required": [
+                    "workspace_id",
+                    "user_id"
+                ]
+            }
+        },
+        {
+            "name": "calendar_cancel_event",
+            "description": "Cancel a calendar event/meeting. Removes it from both the system and Google Calendar, and notifies attendees.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "meeting_id": {
+                        "type": "string",
+                        "description": "The ID of the meeting to cancel"
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "The workspace ID of the meeting"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "The user ID cancelling the meeting"
+                    }
+                },
+                "required": [
+                    "meeting_id",
+                    "workspace_id",
+                    "user_id"
+                ]
+            }
+        },
+        {
+            "name": "calendar_add_attendees",
+            "description": "Add attendees to an existing calendar event/meeting. Adds new people to the event and sends them invites.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "meeting_id": {
+                        "type": "string",
+                        "description": "The ID of the existing meeting to add attendees to"
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "The workspace ID of the meeting"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "The user ID making the invitation"
+                    },
+                    "attendee_emails": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "format": "email"
+                        },
+                        "description": "Array of new attendee email addresses to invite"
+                    },
+                    "attendee_names": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Array of new attendee names (corresponding to emails)"
+                    }
+                },
+                "required": [
+                    "meeting_id",
+                    "workspace_id",
+                    "user_id",
+                    "attendee_emails"
+                ]
+            }
+        }
+    ]
+}
