@@ -754,7 +754,7 @@ export class ChatSession extends DurableObject {
 		});
 
 		// Simulate streaming response (replace with actual AI later)
-		await this.simulateStreamingResponse(webSocket, aiMessage, userMessage.content);
+		await this.simulateStreamingResponse(webSocket, aiMessage, userMessage.content, session);
 
 		// Mark streaming as complete
 		this.sendStreamingChunk(webSocket, {
@@ -779,18 +779,50 @@ export class ChatSession extends DurableObject {
 		webSocket: WebSocket,
 		aiMessage: ChatMessage,
 		userContent: string,
+		session?: IChatSession,
 	): Promise<void> {
-		// Simple response simulation - replace with actual AI later
-		const responses = [
-			'I understand you said: "',
-			userContent,
-			'"\n\n',
-			'This is a simulated streaming response. ',
-			'In the future, this will be replaced with actual AI responses. ',
-			'The streaming functionality is working correctly! ',
-			'Each chunk is being sent individually to create a smooth typing effect. ',
-			'Thank you for testing the chat system!',
-		];
+		// Get accumulated context to make AI smarter
+		let accumulatedContext = '';
+		if (session) {
+			accumulatedContext = this.getAccumulatedContext(session.id);
+			console.log('🧠 AI Response Context:', {
+				sessionId: session.id,
+				contextLength: accumulatedContext.length,
+				hasContext: accumulatedContext.length > 0,
+				mcpResponsesCount: session.metadata?.mcpResponses?.length || 0,
+				contextPreview: accumulatedContext.substring(0, 200) + (accumulatedContext.length > 200 ? '...' : '')
+			});
+		}
+
+		// Enhanced response simulation with context awareness
+		let responses: string[];
+
+		if (accumulatedContext) {
+			// Smart response using accumulated context
+			responses = [
+				'I understand you said: "',
+				userContent,
+				'"\n\n',
+				'Based on our conversation history, I can see you\'ve been working with contacts and meetings. ',
+				accumulatedContext,
+				'\n\nThis is a context-aware streaming response! ',
+				'The AI can now access your accumulated MCP data to provide smarter responses. ',
+				'Each chunk is being sent individually to create a smooth typing effect. ',
+				'Thank you for testing the intelligent chat system!',
+			];
+		} else {
+			// Basic response when no context available
+			responses = [
+				'I understand you said: "',
+				userContent,
+				'"\n\n',
+				'This is a simulated streaming response. ',
+				'In the future, this will be replaced with actual AI responses. ',
+				'The streaming functionality is working correctly! ',
+				'Each chunk is being sent individually to create a smooth typing effect. ',
+				'Thank you for testing the chat system!',
+			];
+		}
 
 		for (let i = 0; i < responses.length; i++) {
 			// Add delay between chunks for realistic streaming effect
@@ -834,15 +866,39 @@ export class ChatSession extends DurableObject {
 	 */
 	async accumulateMCPResponse(sessionId: string, action: string, parameters: any, result: any, success: boolean, error?: string): Promise<void> {
 		try {
-			const session = this.sessions.get(sessionId);
+			let session = this.sessions.get(sessionId);
+
+			// If session doesn't exist, create it
 			if (!session) {
-				console.warn('Session not found for MCP response accumulation:', sessionId);
-				return;
+				console.log('📝 Creating session for MCP accumulation:', sessionId);
+
+				const baseSession = {
+					id: sessionId,
+					supabaseSessionId: sessionId, // Use sessionId as supabaseSessionId
+					userId: this.currentUserId!, // Now guaranteed to be set
+					workspaceId: this.workspaceId!, // Now guaranteed to be set
+					messages: [],
+					actions: [],
+					isActive: true,
+					createdAt: new Date(),
+					lastActivity: new Date()
+				};
+
+				// Initialize with database data (metadata + existing messages)
+				session = await this.metadataManager.initializeSession(sessionId, baseSession);
+				this.sessions.set(sessionId, session);
+
+				console.log('✅ Created session for MCP accumulation:', sessionId);
 			}
 
 			await this.metadataManager.addMCPResponse(session, action, parameters, result, success, error);
 
-			console.log('✅ MCP response accumulated for session:', sessionId);
+			console.log('✅ MCP response accumulated for session:', {
+				sessionId,
+				action,
+				success,
+				totalMCPActions: session.metadata?.mcpResponses?.length || 0
+			});
 		} catch (error) {
 			console.error('❌ Failed to accumulate MCP response:', error);
 		}

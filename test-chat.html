@@ -224,6 +224,15 @@
                 <button onclick="testMeetingAccumulation()">📅 Test Meeting Draft</button>
                 <button onclick="testSessionSummary()">📊 Get Session Summary</button>
                 <button onclick="runFullTest()" style="background-color: #28a745; margin-top: 10px;">🚀 Run Full Test Suite</button>
+                <button onclick="runIntelligentAIFlow()" style="background-color: #17a2b8; margin-top: 10px;">🧠 Test Intelligent AI Flow</button>
+            </div>
+            <div style="margin-top: 15px; padding: 10px; background-color: #e7f3ff; border-radius: 5px; border-left: 4px solid #17a2b8;">
+                <strong>🧠 Intelligent AI Flow:</strong> This test demonstrates the complete workflow:
+                <ol style="margin: 5px 0; padding-left: 20px;">
+                    <li>Accumulates MCP context (contacts, emails, meetings)</li>
+                    <li>Sends a contextual message</li>
+                    <li>Shows AI using accumulated context for smarter responses</li>
+                </ol>
             </div>
         </div>
 
@@ -653,6 +662,71 @@
 
             addMessage('✅ Full Test Suite Complete!', 'system');
             addMessage('Check the results above to verify MCP caching is working correctly.', 'system');
+        }
+
+        async function runIntelligentAIFlow() {
+            addMessage('🧠 Starting Intelligent AI Flow Test...', 'system');
+
+            // Step 1: Connect WebSocket
+            addMessage('Step 1: 🔌 Connecting WebSocket...', 'system');
+            connect();
+
+            // Wait for connection
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Step 2: Accumulate Contact Context
+            addMessage('Step 2: 📇 Accumulating contact context...', 'system');
+            testMCPAccumulation();
+
+            // Wait for accumulation
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Step 3: Accumulate Email Context
+            addMessage('Step 3: 📧 Accumulating email context...', 'system');
+            testEmailAccumulation();
+
+            // Wait for accumulation
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Step 4: Accumulate Meeting Context
+            addMessage('Step 4: 📅 Accumulating meeting context...', 'system');
+            testMeetingAccumulation();
+
+            // Wait for accumulation
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Step 5: Send Contextual Message
+            addMessage('Step 5: 💬 Sending contextual message...', 'system');
+            const contextualMessage = "Can you help me with my contacts and schedule?";
+
+            // Send the message programmatically
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const message = {
+                    type: 'message',
+                    content: contextualMessage,
+                    sessionId: document.getElementById('sessionId').value,
+                    messageId: `intelligent-${messageCounter++}`
+                };
+                ws.send(JSON.stringify(message));
+                addMessage(`Sent: ${contextualMessage}`, 'sent');
+            }
+
+            // Wait for AI response
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
+            // Step 6: Get Session Summary
+            addMessage('Step 6: 📊 Getting session summary...', 'system');
+            testSessionSummary();
+
+            // Wait for summary
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            addMessage('✅ Intelligent AI Flow Complete!', 'system');
+            addMessage('🎉 The AI should now be using accumulated context to provide smarter responses!', 'system');
+            addMessage('💡 Try asking questions like:', 'system');
+            addMessage('   • "Who did I contact recently?"', 'system');
+            addMessage('   • "What meetings do I have?"', 'system');
+            addMessage('   • "What emails did I draft?"', 'system');
         }
 
         // Auto-connect on page load (optional)

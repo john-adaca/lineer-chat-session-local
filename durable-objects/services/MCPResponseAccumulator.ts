@@ -50,7 +50,7 @@ export class MCPResponseAccumulator {
 			this.accumulateContext(session, mcpResponse);
 
 			// Save to database
-			await this.databaseService.updateMCPResponses(session.id, mcpResponse);
+			await this.databaseService.updateMCPResponses(session.id, mcpResponse, session.userId, session.workspaceId);
 
 			console.log('✅ MCP response accumulated:', {
 				sessionId: session.id,
@@ -81,6 +81,10 @@ export class MCPResponseAccumulator {
 
 		// Extract and accumulate context based on action type
 		const action = mcpResponse.action.toLowerCase();
+		console.log('🔄 Accumulating context for action:', action, {
+			hasResult: !!mcpResponse.result,
+			resultType: Array.isArray(mcpResponse.result) ? 'array' : typeof mcpResponse.result
+		});
 
 		if (action.includes('contact')) {
 			this.accumulateContactContext(context, mcpResponse);
@@ -91,6 +95,14 @@ export class MCPResponseAccumulator {
 		} else if (action.includes('task')) {
 			this.accumulateTaskContext(context, mcpResponse);
 		}
+
+		console.log('📊 Context accumulated:', {
+			contactsCount: context.contacts?.length || 0,
+			emailsCount: context.emails?.length || 0,
+			meetingsCount: context.meails?.length || 0,
+			tasksCount: context.tasks?.length || 0,
+			recentActionsCount: context.recentActions?.length || 0
+		});
 
 		// Always add to recent actions (keep last 10)
 		context.recentActions.unshift({
@@ -103,8 +115,16 @@ export class MCPResponseAccumulator {
 	}
 
 	private accumulateContactContext(context: any, response: MCPResponse): void {
+		console.log('👥 Accumulating contact context:', {
+			success: response.success,
+			hasResult: !!response.result,
+			resultLength: Array.isArray(response.result) ? response.result.length : 1
+		});
+
 		if (response.success && response.result) {
 			const contacts = Array.isArray(response.result) ? response.result : [response.result];
+			console.log('📞 Processing contacts:', contacts.map(c => ({ id: c.id, name: c.name })));
+
 			contacts.forEach((contact: any) => {
 				if (contact.id && contact.name) {
 					context.contacts.push({
@@ -114,12 +134,22 @@ export class MCPResponseAccumulator {
 						lastInteraction: response.timestamp,
 						source: response.action
 					});
+					console.log('✅ Added contact to context:', contact.name);
+				} else {
+					console.log('⚠️ Skipping contact - missing id or name:', contact);
 				}
 			});
+
 			// Keep only unique contacts (by ID)
+			const beforeCount = context.contacts.length;
 			context.contacts = context.contacts.filter((contact: any, index: number, self: any[]) =>
 				index === self.findIndex((c: any) => c.id === contact.id)
 			);
+			const afterCount = context.contacts.length;
+
+			console.log('🧹 Contact deduplication:', { before: beforeCount, after: afterCount });
+		} else {
+			console.log('❌ Not accumulating contacts - no result or failed response');
 		}
 	}
 

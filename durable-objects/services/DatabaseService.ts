@@ -32,11 +32,12 @@ export class DatabaseService {
 	 */
 	async saveSessionMetadata(session: ChatSession): Promise<void> {
 		try {
-			const sessionData: SessionMetadata = {
+			// Use the actual database schema
+			const sessionData = {
 				id: session.id,
-				supabaseSessionId: session.supabaseSessionId,
-				userId: session.userId,
-				workspaceId: session.workspaceId,
+				user_id: session.userId,
+				workspace_id: session.workspaceId,
+				mode: 'text', // Default mode
 				metadata: session.metadata || {
 					mcpResponses: [],
 					contextAccumulated: {},
@@ -44,10 +45,7 @@ export class DatabaseService {
 					createdFromUI: !!session.supabaseSessionId,
 					lastMCPInteraction: null,
 					totalMCPActions: 0
-				},
-				createdAt: session.createdAt,
-				lastActivity: session.lastActivity,
-				isActive: session.isActive
+				}
 			};
 
 			// First try to update existing session
@@ -60,8 +58,7 @@ export class DatabaseService {
 				},
 				body: JSON.stringify({
 					metadata: sessionData.metadata,
-					lastActivity: sessionData.lastActivity,
-					isActive: sessionData.isActive
+					updated_at: new Date().toISOString()
 				})
 			});
 
@@ -86,10 +83,10 @@ export class DatabaseService {
 
 			console.log('✅ Session metadata saved to database:', {
 				sessionId: session.id,
-				supabaseSessionId: sessionData.supabaseSessionId,
-				userId: sessionData.userId,
-				workspaceId: sessionData.workspaceId,
-				hasMetadata: !!sessionData.metadata
+				userId: sessionData.user_id,
+				workspaceId: sessionData.workspace_id,
+				hasMetadata: !!sessionData.metadata,
+				totalMCPActions: sessionData.metadata?.totalMCPActions || 0
 			});
 		} catch (error) {
 			console.error('❌ Database service error:', error);
@@ -130,7 +127,7 @@ export class DatabaseService {
 	/**
 	 * Update MCP responses in session metadata
 	 */
-	async updateMCPResponses(sessionId: string, mcpResponse: MCPResponse): Promise<void> {
+	async updateMCPResponses(sessionId: string, mcpResponse: MCPResponse, userId?: string, workspaceId?: string): Promise<void> {
 		try {
 			// First load existing metadata
 			const existing = await this.loadSessionMetadata(sessionId);
@@ -148,31 +145,58 @@ export class DatabaseService {
 			metadata.lastMCPInteraction = new Date();
 			metadata.totalMCPActions = metadata.mcpResponses.length;
 
-			// Update in database
-			const updateData = {
-				id: sessionId,
-				metadata: metadata,
-				lastActivity: new Date()
-			};
-
-			const response = await fetch(`${this.supabaseUrl}/rest/v1/chat_sessions?id=eq.${sessionId}`, {
+			// Try to update existing session first
+			let response = await fetch(`${this.supabaseUrl}/rest/v1/chat_sessions?id=eq.${sessionId}`, {
 				method: 'PATCH',
 				headers: {
 					'Content-Type': 'application/json',
 					'Authorization': `Bearer ${this.supabaseKey}`,
 					'apikey': this.supabaseKey
 				},
-				body: JSON.stringify(updateData)
+				body: JSON.stringify({
+					metadata: metadata,
+					updated_at: new Date().toISOString()
+				})
 			});
 
+			// If session doesn't exist (404), create it
+			if (response.status === 404) {
+				console.log('📝 Session not found in database, creating for MCP update:', sessionId);
+
+				const sessionData = {
+					id: sessionId,
+					user_id: userId || 'system',
+					workspace_id: workspaceId || 'default',
+					mode: 'text',
+					metadata: metadata
+				};
+
+				response = await fetch(`${this.supabaseUrl}/rest/v1/chat_sessions`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'Authorization': `Bearer ${this.supabaseKey}`,
+						'apikey': this.supabaseKey
+					},
+					body: JSON.stringify(sessionData)
+				});
+			}
+
 			if (!response.ok) {
+				const errorText = await response.text();
+				console.error('❌ Failed to update MCP responses:', {
+					sessionId,
+					status: response.status,
+					error: errorText
+				});
 				throw new Error(`Failed to update MCP responses: ${response.status}`);
 			}
 
 			console.log('✅ MCP response saved to database:', {
 				sessionId,
 				action: mcpResponse.action,
-				success: mcpResponse.success
+				success: mcpResponse.success,
+				totalMCPActions: metadata.totalMCPActions
 			});
 		} catch (error) {
 			console.error('❌ Failed to update MCP responses:', error);
