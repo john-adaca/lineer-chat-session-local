@@ -277,13 +277,7 @@ export class DatabaseService {
 				throw new Error(`Database save failed: ${response.status}`);
 			}
 
-			console.log('✅ Chat message saved to database:', {
-				messageId: message.id,
-				role: message.role,
-				contentLength: message.content?.length || 0,
-				contentPreview: message.content?.substring(0, 100) + (message.content?.length > 100 ? '...' : ''),
-				isOwnMessage: message.role === 'user'
-			});
+		
 		} catch (error) {
 			console.error('❌ Database service error saving message:', error);
 			// Don't throw - we don't want database failures to break chat

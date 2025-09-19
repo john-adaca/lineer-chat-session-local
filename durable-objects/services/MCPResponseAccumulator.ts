@@ -219,37 +219,49 @@ export class MCPResponseAccumulator {
 	 */
 	getAccumulatedContext(session: ChatSession): string {
 		if (!session.metadata?.contextAccumulated) {
+			console.log('❌ No contextAccumulated in session metadata');
 			return '';
 		}
 
 		const context = session.metadata.contextAccumulated;
 		let contextString = '';
 
+	
 		// Recent contacts
 		if (context.contacts?.length > 0) {
-			contextString += `\nRecent contacts: ${context.contacts.slice(0, 5).map((c: any) => c.name).join(', ')}`;
+			const contactDetails = context.contacts.slice(0, 5).map((c: any) =>
+				c.email ? `${c.name} (${c.email})` : c.name
+			).join(', ');
+			contextString += `\nRecent contacts: ${contactDetails}`;
 		}
 
 		// Recent emails
 		if (context.emails?.length > 0) {
-			contextString += `\nRecent email subjects: ${context.emails.slice(0, 3).map((e: any) => e.subject).join(', ')}`;
+			const emailSubjects = context.emails.slice(0, 3).map((e: any) => e.subject).join(', ');
+			contextString += `\nRecent email subjects: ${emailSubjects}`;
 		}
 
 		// Upcoming meetings
 		if (context.meetings?.length > 0) {
-			contextString += `\nRecent meetings: ${context.meetings.slice(0, 3).map((m: any) => m.title).join(', ')}`;
+			const meetingTitles = context.meetings.slice(0, 3).map((m: any) => m.title).join(', ');
+			contextString += `\nRecent meetings: ${meetingTitles}`;
 		}
 
 		// Recent tasks
 		if (context.tasks?.length > 0) {
-			contextString += `\nRecent tasks: ${context.tasks.slice(0, 3).map((t: any) => t.title).join(', ')}`;
+			const taskTitles = context.tasks.slice(0, 3).map((t: any) => t.title).join(', ');
+			contextString += `\nRecent tasks: ${taskTitles}`;
+			console.log('✅ Added tasks to context:', taskTitles);
 		}
 
 		// Recent actions
 		if (context.recentActions?.length > 0) {
-			contextString += `\nRecent actions: ${context.recentActions.slice(0, 3).map((a: any) => a.action).join(', ')}`;
+			const recentActionNames = context.recentActions.slice(0, 3).map((a: any) => a.action).join(', ');
+			contextString += `\nRecent actions: ${recentActionNames}`;
+			console.log('✅ Added recent actions to context:', recentActionNames);
 		}
 
+		console.log('📝 Final context string:', contextString || '(empty)');
 		return contextString;
 	}
 

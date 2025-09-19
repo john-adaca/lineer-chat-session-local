@@ -804,11 +804,7 @@ Current conversation has ${context.messages.length} messages.`,
 	private sendStreamingChunk(webSocket: WebSocket, chunk: AIStreamChunk): void {
 		if (webSocket.readyState === WebSocket.OPEN) {
 			webSocket.send(JSON.stringify(chunk));
-			console.log(
-				'📤 Sent streaming chunk:',
-				chunk.type,
-				chunk.content ? `"${chunk.content.substring(0, 50)}..."` : '',
-			);
+		
 		}
 	}
 

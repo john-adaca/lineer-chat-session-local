@@ -781,73 +781,217 @@ export class ChatSession extends DurableObject {
 		userContent: string,
 		session?: IChatSession,
 	): Promise<void> {
-		// Get accumulated context to make AI smarter
-		let accumulatedContext = '';
-		if (session) {
-			accumulatedContext = this.getAccumulatedContext(session.id);
-			console.log('🧠 AI Response Context:', {
-				sessionId: session.id,
-				contextLength: accumulatedContext.length,
-				hasContext: accumulatedContext.length > 0,
-				mcpResponsesCount: session.metadata?.mcpResponses?.length || 0,
-				contextPreview: accumulatedContext.substring(0, 200) + (accumulatedContext.length > 200 ? '...' : '')
-			});
-		}
+		try {
+			// Get accumulated context to make AI smarter
+			let accumulatedContext = '';
+			if (session) {
+				accumulatedContext = this.getAccumulatedContext(session.id);
+			
+			}
 
-		// Enhanced response simulation with context awareness
-		let responses: string[];
+			// Build AI prompt with context
+			const systemPrompt = this.buildAIPrompt(accumulatedContext, session);
 
-		if (accumulatedContext) {
-			// Smart response using accumulated context
-			responses = [
-				'I understand you said: "',
-				userContent,
-				'"\n\n',
-				'Based on our conversation history, I can see you\'ve been working with contacts and meetings. ',
-				accumulatedContext,
-				'\n\nThis is a context-aware streaming response! ',
-				'The AI can now access your accumulated MCP data to provide smarter responses. ',
-				'Each chunk is being sent individually to create a smooth typing effect. ',
-				'Thank you for testing the intelligent chat system!',
-			];
-		} else {
-			// Basic response when no context available
-			responses = [
-				'I understand you said: "',
-				userContent,
-				'"\n\n',
-				'This is a simulated streaming response. ',
-				'In the future, this will be replaced with actual AI responses. ',
-				'The streaming functionality is working correctly! ',
-				'Each chunk is being sent individually to create a smooth typing effect. ',
-				'Thank you for testing the chat system!',
-			];
-		}
+			// Call OpenAI API with conversation history
+			const aiResponse = await this.callOpenAI(systemPrompt, userContent, session);
 
-		for (let i = 0; i < responses.length; i++) {
-			// Add delay between chunks for realistic streaming effect
-			await new Promise((resolve) => setTimeout(resolve, 100 + Math.random() * 200));
+			// Stream the response
+			await this.streamOpenAIResponse(webSocket, aiMessage, aiResponse);
 
-			const chunk = responses[i];
-			aiMessage.content += chunk;
+		} catch (error) {
+			console.error('❌ Error in AI response:', error);
+			// Fallback to basic response
+			const fallbackResponse = `I understand you said: "${userContent}"\n\nI'm currently experiencing some technical difficulties, but I'm here to help! Could you please try again in a moment?`;
+			aiMessage.content = fallbackResponse;
 
-			// Send content chunk
 			this.sendStreamingChunk(webSocket, {
 				type: 'content',
-				content: chunk || '',
+				content: fallbackResponse,
 				messageId: aiMessage.id,
 			});
+		}
+	}
+
+	private buildAIPrompt(accumulatedContext: string, session?: IChatSession): string {
+		let prompt = `You are a helpful AI assistant with access to workspace tools and context.
+
+You can perform various actions using MCP (Model Context Protocol) tools:
+- Search for contacts: contacts_search(query)
+- Draft emails: email_draft_email(to, subject, body)
+- Check calendar availability: calendar_check_availability(date)
+- Schedule meetings: meeting_draft_meeting(attendees, title, start_time)
+- And many more workspace actions...
+
+IMPORTANT: Use the provided context to give direct, specific answers. When users use pronouns like "him", "her", "it", or "that", refer to the most recent relevant item from the context.
+
+`;
+
+		if (accumulatedContext) {
+			prompt += `\nCONTEXT FROM PREVIOUS INTERACTIONS:\n${accumulatedContext}\n`;
+		}
+
+		if (session?.metadata?.mcpResponses?.length) {
+			prompt += `\nRECENT MCP ACTIONS:\n`;
+			session.metadata.mcpResponses.slice(-3).forEach(response => {
+				prompt += `- ${response.action}: ${response.success ? 'Success' : 'Failed'}\n`;
+			});
+		}
+
+		prompt += `\nCRITICAL RESPONSE RULES:
+1. ALWAYS use the most recent contact/person mentioned for pronouns like "him", "her", "his", "her"
+2. If user just searched for someone, that person is the one they're referring to
+3. Provide email addresses directly from context without asking for clarification
+4. Use the context information to give specific, direct answers
+5. Don't ask "which one" when there's a clear most recent reference
+
+CONVERSATION FLOW EXAMPLES:
+
+Example 1:
+Context: "Recent contacts: John Doe (john@example.com), John Smith (john.smith@example.com)"
+User just said: "search for john smith"
+User now says: "whats his email?"
+CORRECT Response: "John Smith's email is john.smith@example.com"
+
+Example 2:
+Context: "Recent email subjects: Project Update, Meeting Notes"
+User: "what emails did I draft?"
+CORRECT Response: "You recently drafted emails with subjects: 'Project Update' and 'Meeting Notes'"
+
+Example 3:
+Context: "Recent meetings: Project Review Meeting"
+User: "what meetings do we have?"
+CORRECT Response: "You recently scheduled a 'Project Review Meeting'"
+
+WRONG Response: "I have information about multiple contacts. Which one do you mean?"
+
+For pronouns and references:
+- "him/her/his/her" = most recent person/contact mentioned
+- "that email" = most recent email action
+- "this meeting" = most recent meeting action
+- "those contacts" = all recent contacts`;
+
+		return prompt;
+	}
+
+	private async callOpenAI(systemPrompt: string, userMessage: string, session?: IChatSession): Promise<string> {
+		const openaiApiKey = this.env.OPENAI_API_KEY;
+
+		if (!openaiApiKey) {
+			throw new Error('OpenAI API key not configured');
+		}
+
+		// Build conversation history (last 10 messages)
+		const messages = [{ role: 'system', content: systemPrompt }];
+
+		if (session?.messages) {
+			// Get last 20 messages (excluding current user message)
+			const recentMessages = session.messages.slice(-20);
+
+			console.log('📜 Processing conversation history:', {
+				totalMessages: session.messages.length,
+				recentMessagesCount: recentMessages.length,
+				sampleMessages: recentMessages.slice(-3).map((msg, i) => ({
+					index: recentMessages.length - 3 + i,
+					role: msg.role,
+					contentLength: msg.content?.length || 0,
+					contentPreview: msg.content?.substring(0, 30) + '...'
+				}))
+			});
+
+			// Add conversation history
+			let historyCount = 0;
+			recentMessages.forEach((msg, index) => {
+				if (msg.role === 'user' || msg.role === 'assistant') {
+					messages.push({
+						role: msg.role,
+						content: msg.content
+					});
+					historyCount++;
+				} else {
+					console.log('⚠️ Skipping message with invalid role:', {
+						index,
+						role: msg.role,
+						contentLength: msg.content?.length || 0
+					});
+				}
+			});
+
+			console.log('✅ Added conversation history:', {
+				historyMessagesAdded: historyCount,
+				totalMessagesInPayload: messages.length
+			});
+		}
+
+		// Add current user message
+		messages.push({
+			role: 'user',
+			content: userMessage
+		});
+
+		console.log('🤖 Sending to OpenAI:', {
+			messageCount: messages.length,
+			conversationHistory: messages.slice(1, -1).length, // Exclude system and current user
+			historyLimit: 20,
+			systemPromptLength: systemPrompt.length,
+			currentMessage: userMessage.substring(0, 50) + '...'
+		});
+
+		const response = await fetch('https://api.openai.com/v1/chat/completions', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'Authorization': `Bearer ${openaiApiKey}`,
+			},
+			body: JSON.stringify({
+				model: 'gpt-3.5-turbo',
+				messages: messages,
+				max_tokens: 1000,
+				temperature: 0.7,
+				stream: false // We'll implement streaming later if needed
+			})
+		});
+
+		if (!response.ok) {
+			const error = await response.text();
+			throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+		}
+
+		const data = await response.json();
+		return data.choices[0]?.message?.content || 'I apologize, but I couldn\'t generate a response.';
+	}
+
+	private async streamOpenAIResponse(
+		webSocket: WebSocket,
+		aiMessage: ChatMessage,
+		fullResponse: string
+	): Promise<void> {
+		// Split response into chunks for streaming effect
+		const words = fullResponse.split(' ');
+		let currentChunk = '';
+
+		for (let i = 0; i < words.length; i++) {
+			currentChunk += (i > 0 ? ' ' : '') + words[i];
+
+			// Send chunk every few words or at natural breaks
+			if (i % 3 === 0 || i === words.length - 1 || words[i].includes('.') || words[i].includes('!') || words[i].includes('?')) {
+				aiMessage.content = currentChunk;
+
+				this.sendStreamingChunk(webSocket, {
+					type: 'content',
+					content: currentChunk,
+					messageId: aiMessage.id,
+				});
+
+				// Small delay for realistic streaming
+				await new Promise((resolve) => setTimeout(resolve, 50 + Math.random() * 100));
+			}
 		}
 	}
 
 	private sendStreamingChunk(webSocket: WebSocket, chunk: AIStreamChunk): void {
 		if (webSocket.readyState === WebSocket.OPEN) {
 			webSocket.send(JSON.stringify(chunk));
-			console.log(
-				'📤 Sent streaming chunk:',
-				chunk.type,
-				chunk.content ? `"${chunk.content.substring(0, 50)}..."` : '',
-			);
+		
 		}
 	}
 

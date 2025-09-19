@@ -722,11 +722,13 @@
             await new Promise(resolve => setTimeout(resolve, 1000));
 
             addMessage('✅ Intelligent AI Flow Complete!', 'system');
-            addMessage('🎉 The AI should now be using accumulated context to provide smarter responses!', 'system');
-            addMessage('💡 Try asking questions like:', 'system');
-            addMessage('   • "Who did I contact recently?"', 'system');
-            addMessage('   • "What meetings do I have?"', 'system');
-            addMessage('   • "What emails did I draft?"', 'system');
+            addMessage('🎉 The AI is now using GPT-3.5-turbo with accumulated context!', 'system');
+            addMessage('🤖 Try these natural conversations:', 'system');
+            addMessage('   • "search for john in my contacts"', 'system');
+            addMessage('   • "send him an email about the project"', 'system');
+            addMessage('   • "am I available tomorrow?"', 'system');
+            addMessage('   • "schedule a meeting with john"', 'system');
+            addMessage('💡 The AI will automatically use MCP tools and remember context!', 'system');
         }
 
         // Auto-connect on page load (optional)
