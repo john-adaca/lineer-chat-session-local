@@ -837,11 +837,37 @@ export class ChatSession extends DurableObject {
 	}
 
 	private buildAIPrompt(accumulatedContext: string, session?: IChatSession): string {
+		const currentDate = new Date().toISOString();
+		const currentDateFormatted = new Date().toLocaleDateString('en-US', { 
+			weekday: 'long', 
+			year: 'numeric', 
+			month: 'long', 
+			day: 'numeric' 
+		});
+		
 		let prompt = `You are a helpful AI assistant with access to workspace tools and context.
+
+CURRENT DATE AND TIME:
+- Today is ${currentDateFormatted}
+- Current ISO timestamp: ${currentDate}
+- When scheduling meetings or events, use CURRENT dates (2025) not old dates (2023, 2022, etc.)
+- If user says "tomorrow", use ${new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0]}
+- If user says "next week", use dates from ${new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]} onwards
 
 You can perform various actions using MCP (Model Context Protocol) tools. The available functions are provided to you as structured function definitions that you can call directly.
 
 IMPORTANT: Use the provided context to give direct, specific answers. When users use pronouns like "him", "her", "it", or "that", refer to the most recent relevant item from the context.
+
+CALENDAR WORKFLOW:
+- calendar_draft_event: Creates a DRAFT meeting (not sent yet) - use when user wants to create/schedule a meeting
+- calendar_send_event: SENDS the actual meeting invite AND creates calendar event - use when user says "send it" or "send the meeting"
+- calendar_list_events: Lists existing meetings/events
+- calendar_cancel_event: Cancels a meeting
+
+EMAIL WORKFLOW:
+- email_draft_email: Creates a DRAFT email (not sent yet) - use when user wants to compose an email
+- email_send_email: SENDS the actual email - use when user says "send it" or "send the email"
+- email_read_email: Reads emails from inbox
 
 🚨 STOP! READ THIS FIRST: Before calling ANY MCP function, check if you already have the data in the EXISTING CONTACTS/MEETINGS/EMAILS sections below. If you find a match, USE IT instead of searching!
 
@@ -881,6 +907,16 @@ FOR EMAIL OPERATIONS:
 - To send an email: Use the email_id from the EXISTING EMAILS section above  
 - To delete/archive an email: Use the email_id from the EXISTING EMAILS section above
 - The email_id must be a real UUID from the database, not a placeholder
+
+FOR CALENDAR OPERATIONS:
+- When user says "schedule a meeting" or "create a meeting" → Use calendar_draft_event
+- When user says "send it" or "send the meeting" → Use calendar_send_event with meeting_id (creates calendar event AND sends invites)
+- When user says "list meetings" → Use calendar_list_events
+- When user says "cancel meeting" → Use calendar_cancel_event with meeting_id
+- When user says "update meeting" or "change meeting" → Use calendar_update_draft with meeting_id
+- ALWAYS use CURRENT dates (2025) for start_time and end_time, never old dates (2023, 2022, etc.)
+- Use the current date context provided above to calculate relative dates
+- CRITICAL: Use the EXACT meeting_id from the EXISTING MEETINGS section above, not placeholder values like "2" or "meeting_id"
 `;
 
 		if (accumulatedContext) {
@@ -1606,6 +1642,16 @@ IMPORTANT: Use the ACTUAL email_id from the existing context data, not placehold
 				case 'calendar_cancel_event':
 					result = await this.mcpClient.cancelMeeting(args.meeting_id);
 					break;
+
+				case 'calendar_update_draft':
+					result = await this.mcpClient.updateMeetingDraft(
+						args.meeting_id,
+						args.title,
+						args.start_time,
+						args.end_time,
+						args.description
+					);
+					break;
 	
 				// Email functions
 				case 'email_draft_email':
@@ -2074,15 +2120,24 @@ IMPORTANT: Use the ACTUAL email_id from the existing context data, not placehold
 			});
 		}
 
-		// Add meetings
+		// Add meetings with IDs
 		if (context.meetings && context.meetings.length > 0) {
-			contextString += '\n📅 EXISTING MEETINGS:';
+			contextString += '\n📅 EXISTING MEETINGS (USE THESE IDs FOR MEETING OPERATIONS):';
 			context.meetings.slice(0, 5).forEach((meeting, index) => {
 				if (meeting.subject) {
 					contextString += '\n' + (index + 1) + '. ' + meeting.subject;
+					// CRITICAL: Always show meeting_id as it's essential for meeting operations
+					if (meeting.meeting_id) {
+						contextString += ' (ID: ' + meeting.meeting_id + ')';
+					} else if (meeting.id) {
+						contextString += ' (ID: ' + meeting.id + ')';
+					}
 					if (meeting.startTime) contextString += ' (' + meeting.startTime + ')';
+					if (meeting.status) contextString += ' [Status: ' + meeting.status + ']';
 				}
 			});
+			contextString += '\n\n  👉 IMPORTANT: Use the EXACT meeting IDs shown above when calling meeting functions!';
+			contextString += '\n  👉 EXAMPLE: To update meeting #1, use meeting_id: "' + (context.meetings[0]?.meeting_id || context.meetings[0]?.id || 'REAL_ID_HERE') + '"';
 		}
 
 		// Add emails with more detailed information including IDs
@@ -2258,7 +2313,7 @@ IMPORTANT: Use the ACTUAL email_id from the existing context data, not placehold
 					// Calendar actions
 					{ name: 'calendar_draft_event', description: 'Draft a calendar event/meeting' },
 					{ name: 'calendar_update_draft', description: 'Update a drafted calendar event' },
-					{ name: 'calendar_send_event', description: 'Send a drafted calendar event' },
+					{ name: 'calendar_send_event', description: 'Send a drafted calendar event - creates calendar event and sends invites to attendees' },
 					{ name: 'calendar_list_events', description: 'List calendar events/meetings' },
 					{ name: 'calendar_cancel_event', description: 'Cancel a calendar event' },
 					{ name: 'calendar_add_attendees', description: 'Add attendees to existing event' },
@@ -2356,15 +2411,81 @@ IMPORTANT: Use the ACTUAL email_id from the existing context data, not placehold
 	}
 
 	/**
+	 * Clean up context by removing invalid entries and limiting size
+	 */
+	private cleanupContext(context: any): void {
+		// Clean up contacts
+		if (context.contacts && Array.isArray(context.contacts)) {
+			context.contacts = context.contacts
+				.filter((contact: any) => 
+					contact.id && 
+					contact.id !== 'actual-uuid-here' && 
+					contact.id !== 'uuid' &&
+					contact.name &&
+					contact.email_address
+				)
+				.slice(0, 20); // Keep only 20 most recent
+		}
+
+		// Clean up meetings
+		if (context.meetings && Array.isArray(context.meetings)) {
+			context.meetings = context.meetings
+				.filter((meeting: any) => 
+					meeting.id && 
+					meeting.id !== 'actual-uuid-here' && 
+					meeting.id !== 'uuid' &&
+					meeting.subject
+				)
+				.slice(0, 10); // Keep only 10 most recent
+		}
+
+		// Clean up emails
+		if (context.emails && Array.isArray(context.emails)) {
+			context.emails = context.emails
+				.filter((email: any) => 
+					email.email_id && 
+					email.email_id !== 'actual-uuid-here' && 
+					email.email_id !== 'uuid' &&
+					email.subject
+				)
+				.slice(0, 15); // Keep only 15 most recent
+		}
+
+		// Clean up calendar
+		if (context.calendar && Array.isArray(context.calendar)) {
+			context.calendar = context.calendar
+				.filter((calendar: any) => 
+					calendar.id && 
+					calendar.id !== 'actual-uuid-here' && 
+					calendar.id !== 'uuid' &&
+					calendar.subject
+				)
+				.slice(0, 10); // Keep only 10 most recent
+		}
+	}
+
+	/**
 	 * Merge AI-generated structured context with existing context
 	 */
 	private mergeAIContext(existingContext: any, aiContext: any): void {
 		try {
+			// Clean up existing context first - remove invalid entries
+			this.cleanupContext(existingContext);
 			
-			// Merge contacts
+			// Merge contacts with better deduplication
 			if (aiContext.contacts && Array.isArray(aiContext.contacts)) {
 				existingContext.contacts = existingContext.contacts || [];
-				aiContext.contacts.forEach((newContact: any) => {
+				
+				// Filter out invalid contacts (with placeholder IDs)
+				const validContacts = aiContext.contacts.filter((contact: any) => 
+					contact.id && 
+					contact.id !== 'actual-uuid-here' && 
+					contact.id !== 'uuid' &&
+					contact.name &&
+					contact.email_address
+				);
+				
+				validContacts.forEach((newContact: any) => {
 					// Check if contact already exists (deduplication by id or email)
 					const existingIndex = existingContext.contacts.findIndex((existing: any) => 
 						existing.id === newContact.id || existing.email_address === newContact.email_address
@@ -2380,24 +2501,48 @@ IMPORTANT: Use the ACTUAL email_id from the existing context data, not placehold
 						console.log('✅ Added new contact:', newContact.name);
 					}
 				});
+				
+				// Keep only the most recent 20 contacts to prevent bloat
+				existingContext.contacts = existingContext.contacts
+					.sort((a: any, b: any) => new Date(b.timestamp || b.created_at || 0).getTime() - new Date(a.timestamp || a.created_at || 0).getTime())
+					.slice(0, 20);
 			}
 
-			// Merge meetings
+			// Merge meetings with better deduplication
 			if (aiContext.meetings && Array.isArray(aiContext.meetings)) {
 				existingContext.meetings = existingContext.meetings || [];
-				aiContext.meetings.forEach((newMeeting: any) => {
+				
+				// Filter out invalid meetings (with placeholder IDs)
+				const validMeetings = aiContext.meetings.filter((meeting: any) => 
+					meeting.id && 
+					meeting.id !== 'actual-uuid-here' && 
+					meeting.id !== 'uuid' &&
+					meeting.subject
+				);
+				
+				validMeetings.forEach((newMeeting: any) => {
+					// Better deduplication: check by ID first, then by subject + attendees
 					const existingIndex = existingContext.meetings.findIndex((existing: any) => 
-						existing.id === newMeeting.id || (existing.subject === newMeeting.subject && existing.to_email === newMeeting.to_email)
+						existing.id === newMeeting.id || 
+						(existing.subject === newMeeting.subject && 
+						 JSON.stringify(existing.to_email?.sort()) === JSON.stringify(newMeeting.to_email?.sort()))
 					);
 					
 					if (existingIndex >= 0) {
+						// Update existing meeting with newer data
 						existingContext.meetings[existingIndex] = { ...existingContext.meetings[existingIndex], ...newMeeting };
 						console.log('🔄 Updated existing meeting:', newMeeting.subject);
 					} else {
+						// Add new meeting
 						existingContext.meetings.push(newMeeting);
 						console.log('✅ Added new meeting:', newMeeting.subject);
 					}
 				});
+				
+				// Keep only the most recent 10 meetings to prevent bloat
+				existingContext.meetings = existingContext.meetings
+					.sort((a: any, b: any) => new Date(b.timestamp || b.created_at || 0).getTime() - new Date(a.timestamp || a.created_at || 0).getTime())
+					.slice(0, 10);
 			}
 
 			// Merge calendar

@@ -256,11 +256,12 @@ export class MCPClient {
 	}
 
 	/**
-	 * Send meeting invite
+	 * Send meeting invite - creates calendar event and sends invites
 	 */
 	async sendMeetingInvite(meetingId: string): Promise<MCPResponse> {
 		return this.executeAction('calendar_send_event', { 
-			meeting_id: meetingId 
+			meeting_id: meetingId
+			// workspace_id and user_id are set in MCP client context
 		});
 	}
 
@@ -280,6 +281,22 @@ export class MCPClient {
 		return this.executeAction('calendar_cancel_event', { 
 			meeting_id: meetingId 
 		});
+	}
+
+	/**
+	 * Update meeting draft
+	 */
+	async updateMeetingDraft(meetingId: string, title?: string, startTime?: string, endTime?: string, description?: string): Promise<MCPResponse> {
+		const params: any = {
+			meeting_id: meetingId
+		};
+
+		if (title) params.title = title;
+		if (startTime) params.start_time = startTime;
+		if (endTime) params.end_time = endTime;
+		if (description) params.description = description;
+
+		return this.executeAction('calendar_update_draft', params);
 	}
 
 	/**

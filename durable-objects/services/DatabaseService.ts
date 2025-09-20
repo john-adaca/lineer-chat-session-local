@@ -80,14 +80,6 @@ export class DatabaseService {
 				console.error('❌ Failed to save session metadata:', errorText);
 				throw new Error(`Database save failed: ${response.status}`);
 			}
-
-			console.log('✅ Session metadata saved to database:', {
-				sessionId: session.id,
-				userId: sessionData.user_id,
-				workspaceId: sessionData.workspace_id,
-				hasMetadata: !!sessionData.metadata,
-				totalMCPActions: sessionData.metadata?.totalMCPActions || 0
-			});
 		} catch (error) {
 			console.error('❌ Database service error:', error);
 			// Don't throw - we don't want database failures to break chat
