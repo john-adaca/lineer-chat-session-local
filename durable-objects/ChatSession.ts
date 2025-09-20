@@ -5,8 +5,11 @@ import type {
 	ChatMessage,
 	ChatSession as IChatSession,
 	AIStreamChunk,
+	MCPResponse,
 } from '../types';
 import { SessionMetadataManager } from './services/SessionMetadataManager';
+import { MCPClient } from './services/MCPClient';
+import { MCPActionParser } from './services/MCPActionParser';
 
 // MCP Context Management Types
 interface MCPEntityContext {
@@ -68,12 +71,25 @@ export class ChatSession extends DurableObject {
 	private supabaseEnabled: boolean = false;
 	private env: Env;
 	private metadataManager: SessionMetadataManager;
+	private mcpClient: MCPClient;
+	private mcpActionParser: MCPActionParser;
+	private aiSummarizer: any;
+
+	// Dynamic MCP function caching
+	private static mcpFunctionsCache: any[] | null = null;
+	private static mcpFunctionsCacheExpiry: number = 0;
+	private readonly MCP_FUNCTIONS_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
 
 	constructor(state: DurableObjectState, env: Env) {
 		super(state, env);
 		this.state = state;
 		this.env = env;
 		this.metadataManager = new SessionMetadataManager(env);
+
+		// Initialize MCP services
+		this.mcpClient = new MCPClient(env.MCP_SERVER_URL);
+		this.mcpActionParser = new MCPActionParser(this.mcpClient);
+		this.aiSummarizer = null; // Will be initialized when AI service is available
 
 		// Initialize storage immediately
 		console.log('🏗️ ChatSession constructor called');
@@ -499,7 +515,11 @@ export class ChatSession extends DurableObject {
 			}
 
 			// Sort by timestamp (most recent first)
-			allActions.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+			allActions.sort((a, b) => {
+				const aTime = a.timestamp instanceof Date ? a.timestamp.getTime() : new Date(a.timestamp).getTime();
+				const bTime = b.timestamp instanceof Date ? b.timestamp.getTime() : new Date(b.timestamp).getTime();
+				return bTime - aTime;
+			});
 
 			return new Response(JSON.stringify({
 				totalActions: allActions.length,
@@ -786,13 +806,17 @@ export class ChatSession extends DurableObject {
 			let accumulatedContext = '';
 			if (session) {
 				accumulatedContext = this.getAccumulatedContext(session.id);
-			
+				console.log('🧠 Context being sent to AI:', {
+					hasContext: !!accumulatedContext,
+					contextLength: accumulatedContext.length,
+					contextPreview: accumulatedContext.substring(0, 200) + '...'
+				});
 			}
 
 			// Build AI prompt with context
 			const systemPrompt = this.buildAIPrompt(accumulatedContext, session);
 
-			// Call OpenAI API with conversation history
+			// Call OpenAI API with function calling (handles MCP actions internally)
 			const aiResponse = await this.callOpenAI(systemPrompt, userContent, session);
 
 			// Stream the response
@@ -815,15 +839,48 @@ export class ChatSession extends DurableObject {
 	private buildAIPrompt(accumulatedContext: string, session?: IChatSession): string {
 		let prompt = `You are a helpful AI assistant with access to workspace tools and context.
 
-You can perform various actions using MCP (Model Context Protocol) tools:
-- Search for contacts: contacts_search(query)
-- Draft emails: email_draft_email(to, subject, body)
-- Check calendar availability: calendar_check_availability(date)
-- Schedule meetings: meeting_draft_meeting(attendees, title, start_time)
-- And many more workspace actions...
+You can perform various actions using MCP (Model Context Protocol) tools. The available functions are provided to you as structured function definitions that you can call directly.
 
 IMPORTANT: Use the provided context to give direct, specific answers. When users use pronouns like "him", "her", "it", or "that", refer to the most recent relevant item from the context.
 
+🚨 STOP! READ THIS FIRST: Before calling ANY MCP function, check if you already have the data in the EXISTING CONTACTS/MEETINGS/EMAILS sections below. If you find a match, USE IT instead of searching!
+
+🚨 CRITICAL DECISION RULES:
+- BEFORE searching for contacts, check if you already have relevant contacts in the EXISTING CONTACTS section
+- Use FUZZY MATCHING: "john" matches "John Lester", "jane" matches "Jane Smith", etc.
+- Use PARTIAL MATCHING: "john lester" matches "John Lester", "jane smith" matches "Jane Smith"
+- Use CASE-INSENSITIVE matching: "JOHN" matches "John Lester"
+- ONLY search for NEW contacts if you cannot find a reasonable match in existing contacts
+- If you find a match (even partial), USE THE EXISTING CONTACT instead of searching
+- When user says "find john" and you have "John Lester", USE "John Lester"
+- When user says "search john lester" and you have "John Lester", USE "John Lester"
+- Only call search_contacts if you need to find someone completely new or different
+
+FUNCTION CALLS:
+When you need to perform an action, call the appropriate function with the correct parameters. The system will execute the function and return the results for you to analyze and respond to the user.
+
+FUNCTION ERROR HANDLING:
+If a function call fails, the system will return error details. Common error types:
+- "resource_not_found": The requested item doesn't exist
+- "permission_denied": User lacks required permissions
+- "validation_error": Invalid parameters provided
+- "conflict_error": Item already exists or is in use
+- "rate_limit_error": Too many requests recently
+- "server_error": Backend system issues
+- "timeout_error": Request took too long
+- "network_error": Connectivity problems
+
+When functions fail, explain the issue clearly to the user and suggest appropriate alternatives based on the error type and available context data.
+
+You have access to CONTEXT FROM PREVIOUS INTERACTIONS: -- this is where you can get the history of MCP responses
+
+CRITICAL: When you see email IDs in the context (like "ID: 6a8e247b-aeb5-4c35-a1aa-2c500e0cbe90"), you MUST use these EXACT IDs when calling email functions. Never use placeholder values like "uuid" or "email_id".
+
+FOR EMAIL OPERATIONS:
+- To update an email: Use the email_id from the EXISTING EMAILS section above
+- To send an email: Use the email_id from the EXISTING EMAILS section above  
+- To delete/archive an email: Use the email_id from the EXISTING EMAILS section above
+- The email_id must be a real UUID from the database, not a placeholder
 `;
 
 		if (accumulatedContext) {
@@ -880,23 +937,15 @@ For pronouns and references:
 			throw new Error('OpenAI API key not configured');
 		}
 
-		// Build conversation history (last 10 messages)
+		// Get MCP functions dynamically from server (with caching)
+		const mcpFunctions = await this.getMCPFunctions();
+
+		// Build conversation history (last 20 messages)
 		const messages = [{ role: 'system', content: systemPrompt }];
 
 		if (session?.messages) {
 			// Get last 20 messages (excluding current user message)
 			const recentMessages = session.messages.slice(-20);
-
-			console.log('📜 Processing conversation history:', {
-				totalMessages: session.messages.length,
-				recentMessagesCount: recentMessages.length,
-				sampleMessages: recentMessages.slice(-3).map((msg, i) => ({
-					index: recentMessages.length - 3 + i,
-					role: msg.role,
-					contentLength: msg.content?.length || 0,
-					contentPreview: msg.content?.substring(0, 30) + '...'
-				}))
-			});
 
 			// Add conversation history
 			let historyCount = 0;
@@ -907,12 +956,6 @@ For pronouns and references:
 						content: msg.content
 					});
 					historyCount++;
-				} else {
-					console.log('⚠️ Skipping message with invalid role:', {
-						index,
-						role: msg.role,
-						contentLength: msg.content?.length || 0
-					});
 				}
 			});
 
@@ -928,10 +971,11 @@ For pronouns and references:
 			content: userMessage
 		});
 
-		console.log('🤖 Sending to OpenAI:', {
+		console.log('🤖 Sending to OpenAI with function calling:', {
 			messageCount: messages.length,
-			conversationHistory: messages.slice(1, -1).length, // Exclude system and current user
+			conversationHistory: messages.slice(1, -1).length,
 			historyLimit: 20,
+			functionsAvailable: mcpFunctions.length,
 			systemPromptLength: systemPrompt.length,
 			currentMessage: userMessage.substring(0, 50) + '...'
 		});
@@ -945,9 +989,13 @@ For pronouns and references:
 			body: JSON.stringify({
 				model: 'gpt-3.5-turbo',
 				messages: messages,
+				tools: mcpFunctions.map(func => ({
+					type: "function",
+					function: func
+				})),
+				tool_choice: "auto", // Let OpenAI decide when to call functions
 				max_tokens: 1000,
-				temperature: 0.7,
-				stream: false // We'll implement streaming later if needed
+				temperature: 0.7
 			})
 		});
 
@@ -957,7 +1005,953 @@ For pronouns and references:
 		}
 
 		const data = await response.json();
-		return data.choices[0]?.message?.content || 'I apologize, but I couldn\'t generate a response.';
+		const choice = data.choices[0];
+
+		// Check if OpenAI wants to call a function (using the new tools format)
+		if (choice.message.tool_calls) {
+			const toolCall = choice.message.tool_calls[0];
+			if (toolCall.type === 'function') {
+				const functionCall = toolCall.function;
+				console.log('🎯 OpenAI requested function call:', {
+					function: functionCall.name,
+					arguments: functionCall.arguments
+				});
+
+				// Execute the MCP function
+				const functionResult = await this.executeMCPFunction(functionCall.name, JSON.parse(functionCall.arguments), session);
+
+				// Format and store the MCP response for future AI context
+				if (functionResult.success && functionResult.data && session) {
+					await this.formatAndStoreMCPResponse(functionCall.name, functionResult.data, session);
+
+					// Generate AI summary of what happened for better context
+					await this.generateAndStoreAISummary(functionCall.name, functionResult.data, session);
+
+					// Store the last successful action result for follow-up operations
+					if (!session.metadata) {
+						session.metadata = {
+							mcpResponses: [],
+							contextAccumulated: {},
+							sessionType: 'mcp-integrated',
+							createdFromUI: false,
+							lastMCPInteraction: new Date(),
+							totalMCPActions: 0
+						};
+					}
+
+					if (!session.metadata.lastActionResult) {
+						session.metadata.lastActionResult = {};
+					}
+
+					// Store only essential data - let AI handle context summarization
+					session.metadata.lastActionResult[functionCall.name] = {
+						result: {
+							type: 'processed',
+							action: functionCall.name,
+							success: true,
+							timestamp: new Date().toISOString()
+						},
+						timestamp: new Date(),
+						parameters: functionCall.arguments
+					};
+
+					// Keep only last 3 action results to avoid bloat
+					const actionKeys = Object.keys(session.metadata.lastActionResult);
+					if (actionKeys.length > 3) {
+						// Remove oldest actions
+						const sortedKeys = actionKeys.sort((a, b) => {
+							const lastActionResult = session.metadata?.lastActionResult;
+							if (!lastActionResult) return 0;
+
+							const aTime = lastActionResult[a]?.timestamp instanceof Date 
+								? lastActionResult[a].timestamp.getTime() 
+								: new Date(lastActionResult[a]?.timestamp || 0).getTime();
+							const bTime = lastActionResult[b]?.timestamp instanceof Date 
+								? lastActionResult[b].timestamp.getTime() 
+								: new Date(lastActionResult[b]?.timestamp || 0).getTime();
+							return bTime - aTime;
+						});
+
+						const keysToRemove = sortedKeys.slice(3);
+						keysToRemove.forEach(key => {
+							if (session.metadata?.lastActionResult) {
+								delete session.metadata.lastActionResult[key];
+							}
+						});
+					}
+				}
+
+				// Continue conversation with function result
+				const functionMessage = {
+					role: 'assistant',
+					content: null,
+					tool_calls: [toolCall]
+				};
+
+				const functionResultMessage = {
+					role: 'tool',
+					tool_call_id: toolCall.id,
+					content: JSON.stringify(functionResult)
+				};
+
+				// Get final response from OpenAI with function result
+				const finalResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						'Authorization': `Bearer ${openaiApiKey}`,
+					},
+					body: JSON.stringify({
+						model: 'gpt-3.5-turbo',
+						messages: [...messages, functionMessage, functionResultMessage],
+						max_tokens: 1000,
+						temperature: 0.7
+					})
+				});
+
+				if (!finalResponse.ok) {
+					const error = await finalResponse.text();
+					throw new Error(`OpenAI API error: ${finalResponse.status} - ${error}`);
+				}
+
+				const finalData = await finalResponse.json();
+				return finalData.choices[0]?.message?.content || 'I executed the requested action successfully.';
+			}
+		}
+
+		// No function call, return regular response
+		return choice.message.content || 'I apologize, but I couldn\'t generate a response.';
+	}
+
+	/**
+		* Generate AI summary of MCP action and store for future context
+		*/
+	private async generateAndStoreAISummary(functionName: string, rawData: any, session?: IChatSession): Promise<void> {
+		try {
+			if (!session) return;
+
+			// Create a simple prompt for the AI to summarize what happened
+			const summaryPrompt = `You just executed a ${functionName} action. Based on this result data, provide a brief, natural summary of what happened that can be used for future context:
+Use this data if any: ${session.metadata} .
+
+tehn merge merge this new data : ${JSON.stringify(rawData, null, 2)}
+
+Provide a concise summary that captures the key information. Focus on the most important details that a user might want to reference later.
+we will need to accumulate and store critical informations.
+For example :
+	{
+	contacts : [{id : 'actual-uuid-here' , name : John, company : 'adaca' , email_address : 'john.almenanza@adaca.com' , pronoun : him}],
+	meetings : [{id : 'actual-uuid-here' , subject : 'This is a test', to_email : ["recipient@email.com"],message :'this is a test'}],
+	calendar : [{id : 'actual-uuid-here' , subject : 'This is a test calendar'],
+	emails : [{email_id : 'actual-uuid-here' , subject : 'This is a test email', to_emails : ["recipient@email.com"], status : 'draft'}]
+		}
+
+IMPORTANT: Use the ACTUAL email_id from the existing context data, not placeholder values like 'uuid' or 'actual-uuid-here'. The email_id must be a real UUID from the database.
+`;
+
+			// Call OpenAI to generate the summary
+			const summaryResponse = await this.callOpenAIForSummary(summaryPrompt);
+
+			if (summaryResponse) {
+				// Initialize metadata if it doesn't exist
+				if (!session.metadata) {
+					session.metadata = {
+						mcpResponses: [],
+						contextAccumulated: {},
+						sessionType: 'mcp-integrated',
+						createdFromUI: false,
+						lastMCPInteraction: new Date(),
+						totalMCPActions: 0,
+						aiSummaries: []
+					};
+				}
+
+				// Initialize contextAccumulated if it doesn't exist
+				if (!session.metadata.contextAccumulated) {
+					session.metadata.contextAccumulated = {
+						contacts: [],
+						meetings: [],
+						calendar: [],
+						emails: [],
+						tasks: []
+					};
+				}
+
+				// Merge AI-generated structured context with existing context
+				this.mergeAIContext(session.metadata.contextAccumulated, summaryResponse);
+
+				// Initialize aiSummaries array if it doesn't exist
+				if (!session.metadata.aiSummaries) {
+					session.metadata.aiSummaries = [];
+				}
+
+				// Store the AI-generated summary
+				session.metadata.aiSummaries.push({
+					action: functionName,
+					summary: `AI processed ${functionName} and updated context`,
+					timestamp: new Date(),
+					rawDataSize: JSON.stringify(rawData).length
+				});
+
+				// Keep only the last 10 summaries to avoid bloat
+				if (session.metadata.aiSummaries.length > 10) {
+					session.metadata.aiSummaries = session.metadata.aiSummaries.slice(-10);
+				}
+
+				// Save the session with the new AI summary
+				await this.metadataManager.saveSession(session);
+
+				console.log('🤖 AI summary generated and stored:', {
+					action: functionName,
+					summaryLength: summaryResponse.length,
+					totalSummaries: session.metadata.aiSummaries.length
+				});
+			}
+
+		} catch (error) {
+			console.error('❌ Failed to generate AI summary:', error);
+		}
+	}
+
+	/**
+		* Call OpenAI to generate structured context summary
+		*/
+	private async callOpenAIForSummary(prompt: string): Promise<any> {
+		try {
+			const openaiApiKey = this.env.OPENAI_API_KEY;
+			if (!openaiApiKey) {
+				console.warn('OpenAI API key not configured for summary generation');
+				return null;
+			}
+
+			const response = await fetch('https://api.openai.com/v1/chat/completions', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					'Authorization': `Bearer ${openaiApiKey}`,
+				},
+				body: JSON.stringify({
+					model: 'gpt-3.5-turbo',
+					messages: [{
+						role: 'user',
+						content: prompt + '\n\nIMPORTANT: Respond with ONLY a valid JSON object matching the structure shown in the example. Do not include any other text or explanation.\n\nCRITICAL: For emails, always include the email_id field when available, as this is needed for operations like sending emails. The email_id is essential for email operations and should be preserved from the original data.'
+					}],
+					max_tokens: 1000, // More tokens for structured data
+					temperature: 0.1 // Very consistent for JSON
+				})
+			});
+
+			if (!response.ok) {
+				console.error('OpenAI summary API error:', response.status);
+				return null;
+			}
+
+			const data = await response.json();
+			const content = data.choices[0]?.message?.content || null;
+			
+			if (!content) return null;
+
+			// Try to parse the JSON response
+			try {
+				return JSON.parse(content);
+			} catch (parseError) {
+				console.error('Failed to parse AI response as JSON:', parseError);
+				console.log('AI Response:', content);
+				return null;
+			}
+
+		} catch (error) {
+			console.error('Error calling OpenAI for summary:', error);
+			return null;
+		}
+	}
+
+	/**
+		* Format and store MCP response data for future AI context
+		*/
+	private async formatAndStoreMCPResponse(functionName: string, rawData: any, session?: IChatSession): Promise<void> {
+		try {
+			console.log('📝 Formatting MCP response for storage:', { functionName, dataType: typeof rawData });
+
+			// Format the data based on function type
+			const formattedData = await this.formatMCPData(functionName, rawData);
+
+			// Store in session metadata
+			if (session) {
+				if (!session.metadata) {
+					session.metadata = {
+						mcpResponses: [],
+						contextAccumulated: {},
+						sessionType: 'mcp-integrated',
+						createdFromUI: false,
+						lastMCPInteraction: new Date(),
+						totalMCPActions: 0
+					};
+				}
+
+				// Add to MCP responses (let AI handle summarization)
+				session.metadata.mcpResponses = session.metadata.mcpResponses || [];
+				session.metadata.mcpResponses.push({
+					id: `mcp-${Date.now()}`,
+					action: functionName,
+					parameters: {},
+					result: null, // Don't store full result - AI will handle context
+					timestamp: new Date(),
+					success: true
+				} as any);
+
+				// Keep only the last 5 responses to avoid bloat
+				if (session.metadata.mcpResponses.length > 5) {
+					session.metadata.mcpResponses = session.metadata.mcpResponses.slice(-5);
+				}
+
+				// Context accumulation is now handled by AI summarization in MCPResponseAccumulator
+				// No need to store raw data here
+				session.metadata.lastMCPInteraction = new Date();
+				session.metadata.totalMCPActions = (session.metadata.totalMCPActions || 0) + 1;
+
+				console.log('✅ MCP response stored in session metadata:', {
+					functionName,
+					dataSize: JSON.stringify(formattedData).length,
+					totalResponses: session.metadata.mcpResponses.length
+				});
+			}
+
+		} catch (error) {
+			console.error('❌ Failed to format and store MCP response:', error);
+		}
+	}
+
+	/**
+		* Format raw MCP data into structured, readable format
+		*/
+	private async formatMCPData(functionName: string, rawData: any): Promise<any> {
+		try {
+			switch (functionName) {
+				case 'search_contacts':
+					return this.formatContactsData(rawData);
+
+				case 'get_recent_contacts':
+					return this.formatContactsData(rawData);
+
+				case 'draft_email':
+					return this.formatEmailData(rawData);
+
+				case 'schedule_meeting':
+					return this.formatMeetingData(rawData);
+
+				case 'get_tasks':
+				case 'create_task':
+					return this.formatTasksData(rawData);
+
+				case 'read_emails':
+					return this.formatEmailsData(rawData);
+
+				default:
+					// For unknown function types, try to format generically
+					return this.formatGenericData(rawData);
+			}
+		} catch (error) {
+			console.error('❌ Error formatting MCP data:', error);
+			return rawData; // Return raw data as fallback
+		}
+	}
+
+	/**
+		* Format contacts data
+		*/
+	private formatContactsData(data: any): any {
+		if (!Array.isArray(data)) return data;
+
+		const formatted = data.map(contact => ({
+			name: contact.name || contact.display_name || 'Unknown',
+			email: contact.email || contact.email_address || '',
+			company: contact.company || contact.organization || '',
+			phone: contact.phone || contact.phone_number || '',
+			lastContact: contact.last_contacted || contact.updated_at || null
+		}));
+
+		return {
+			type: 'contacts',
+			count: formatted.length,
+			contacts: formatted,
+			summary: `Found ${formatted.length} contact${formatted.length !== 1 ? 's' : ''}`
+		};
+	}
+
+	/**
+		* Format email data
+		*/
+	private formatEmailData(data: any): any {
+		// CRITICAL: Always preserve the email_id field as it's essential for email operations
+		const email_id = data.email_id || data.id;
+		
+		return {
+			type: 'email',
+			email_id: email_id, // This field is critical for email operations
+			subject: data.subject,
+			to_emails: Array.isArray(data.to_emails) ? data.to_emails : (Array.isArray(data.to) ? data.to : [data.to]),
+			from: data.from,
+			body: data.body || data.content,
+			status: data.status || 'draft',
+			created: data.created_at || new Date().toISOString(),
+			summary: `Email "${data.subject}" ${data.status === 'sent' ? 'sent' : 'drafted'} to ${Array.isArray(data.to_emails) ? data.to_emails.join(', ') : (Array.isArray(data.to) ? data.to.join(', ') : data.to)}`
+		};
+	}
+
+	/**
+		* Format meeting data
+		*/
+	private formatMeetingData(data: any): any {
+		return {
+			type: 'meeting',
+			meetingId: data.id || data.meeting_id,
+			title: data.title,
+			attendees: Array.isArray(data.attendees) ? data.attendees : [],
+			startTime: data.start_time || data.scheduled_time,
+			duration: data.duration || 60,
+			location: data.location || 'TBD',
+			status: data.status || 'scheduled',
+			created: data.created_at || new Date().toISOString(),
+			summary: `Meeting "${data.title}" scheduled for ${data.start_time} with ${Array.isArray(data.attendees) ? data.attendees.length : 0} attendee${Array.isArray(data.attendees) && data.attendees.length !== 1 ? 's' : ''}`
+		};
+	}
+
+	/**
+		* Format tasks data
+		*/
+	private formatTasksData(data: any): any {
+		if (!Array.isArray(data)) {
+			// Single task
+			return {
+				type: 'task',
+				taskId: data.id || data.task_id,
+				title: data.title,
+				description: data.description,
+				status: data.status || 'pending',
+				dueDate: data.due_date,
+				assignee: data.assignee,
+				created: data.created_at || new Date().toISOString(),
+				summary: `Task "${data.title}" ${data.status || 'created'}`
+			};
+		}
+
+		// Multiple tasks
+		const formatted = data.map(task => ({
+			id: task.id || task.task_id,
+			title: task.title,
+			status: task.status || 'pending',
+			dueDate: task.due_date,
+			assignee: task.assignee
+		}));
+
+		return {
+			type: 'tasks',
+			count: formatted.length,
+			tasks: formatted,
+			summary: `${formatted.length} task${formatted.length !== 1 ? 's' : ''} found`
+		};
+	}
+
+	/**
+		* Format emails data
+		*/
+	private formatEmailsData(data: any): any {
+		if (!Array.isArray(data)) return data;
+
+		const formatted = data.map(email => {
+			// CRITICAL: Always preserve the email_id field as it's essential for email operations
+			const email_id = email.email_id || email.id;
+			
+			return {
+				email_id: email_id, // This field is critical for email operations
+				subject: email.subject,
+				from: email.from,
+				to_emails: email.to_emails || email.to || [],
+				status: email.status || 'draft',
+				received: email.received_at || email.created_at,
+				isRead: email.is_read || false,
+				hasAttachments: email.has_attachments || false,
+				body: email.body || email.content || ''
+			};
+		});
+
+		return {
+			type: 'emails',
+			count: formatted.length,
+			emails: formatted,
+			summary: `${formatted.length} email${formatted.length !== 1 ? 's' : ''} in inbox`
+		};
+	}
+
+	/**
+		* Format generic data
+		*/
+	private formatGenericData(data: any): any {
+		if (Array.isArray(data)) {
+			return {
+				type: 'list',
+				count: data.length,
+				items: data,
+				summary: `${data.length} item${data.length !== 1 ? 's' : ''} found`
+			};
+		}
+
+		if (typeof data === 'object' && data !== null) {
+			return {
+				type: 'object',
+				data: data,
+				summary: 'Data retrieved successfully'
+			};
+		}
+
+		return {
+			type: 'value',
+			value: data,
+			summary: `Result: ${data}`
+		};
+	}
+
+	/**
+		* Get MCP functions dynamically from server with caching
+		*/
+	private async getMCPFunctions(): Promise<any[]> {
+		const now = Date.now();
+
+		// Check cache first
+		if (ChatSession.mcpFunctionsCache &&
+			now < ChatSession.mcpFunctionsCacheExpiry) {
+			console.log('✅ Using cached MCP functions');
+			return ChatSession.mcpFunctionsCache;
+		}
+
+		try {
+			console.log('🔄 Fetching fresh MCP functions from server...');
+
+			// Set context for MCP client
+			this.mcpClient.setContext({
+				workspaceId: this.workspaceId || '14f49f8a-1e2f-4159-abf9-bbff0078bfa9',
+				userId: this.currentUserId || '330c7620-2914-4a5c-8d5f-e4bac4737d08'
+			});
+
+			// Fetch functions from MCP server
+			const functions = await this.mcpClient.getAvailableFunctions();
+
+			// Cache the functions
+			ChatSession.mcpFunctionsCache = functions;
+			ChatSession.mcpFunctionsCacheExpiry = now + this.MCP_FUNCTIONS_CACHE_TTL;
+
+			console.log(`✅ Fetched and cached ${functions.length} MCP functions`);
+			return functions;
+
+		} catch (error) {
+			console.error('❌ Failed to fetch MCP functions:', error);
+
+			// Return cached functions if available, otherwise empty array
+			if (ChatSession.mcpFunctionsCache) {
+				console.log('⚠️ Using stale cached MCP functions due to fetch error');
+				return ChatSession.mcpFunctionsCache;
+			}
+
+			// Last resort: return empty array to prevent crashes
+			console.log('⚠️ No cached functions available, returning empty array');
+			return [];
+		}
+	}
+
+	/**
+	 * Execute MCP function called by OpenAI
+	 */
+	private async executeMCPFunction(functionName: string, args: any, session?: IChatSession): Promise<any> {
+		try {
+			console.log('🔧 Executing MCP function:', { functionName, args });
+
+			// Set the workspace and user context for MCP calls
+			const workspaceId = session?.workspaceId || this.workspaceId || '14f49f8a-1e2f-4159-abf9-bbff0078bfa9';
+			const userId = session?.userId || this.currentUserId || '330c7620-2914-4a5c-8d5f-e4bac4737d08';
+
+			// Update MCP client with current context
+			this.mcpClient.setContext({ workspaceId, userId });
+
+			let result: MCPResponse;
+
+			// Route to appropriate MCP client method
+			switch (functionName) {
+				// Calendar functions - map to actual MCP client methods
+				case 'calendar_draft_event':
+					result = await this.mcpClient.draftMeeting(
+						args.title,
+						args.attendee_emails || args.attendees,
+						args.start_time,
+						args.duration || 60
+					);
+					break;
+	
+				case 'calendar_send_event':
+					result = await this.mcpClient.sendMeetingInvite(args.meeting_id);
+					break;
+	
+				case 'calendar_list_events':
+					result = await this.mcpClient.listMeetings(args.limit || 20);
+					break;
+	
+				case 'calendar_cancel_event':
+					result = await this.mcpClient.cancelMeeting(args.meeting_id);
+					break;
+	
+				// Email functions
+				case 'email_draft_email':
+					result = await this.mcpClient.draftEmail({
+						to_emails: args.to_emails || args.to,
+						subject: args.subject,
+						body: args.body
+					});
+					break;
+	
+				case 'email_send_email':
+					// Handle both direct email sending and sending existing drafts
+					if (args.email_id) {
+						// Send existing draft
+						result = await this.mcpClient.sendEmail(args.email_id);
+					} else if (args.to_emails && args.subject && args.body) {
+						// Check if we have a session context and accumulated context with similar emails
+						let emailId: string | null = null;
+						
+						// Try to get the current session ID from the context
+						let currentSessionId: string | null = null;
+						if (this.sessions.size === 1) {
+							// If there's only one session, use it
+							currentSessionId = Array.from(this.sessions.keys())[0];
+						}
+						
+						if (currentSessionId) {
+							const session = this.sessions.get(currentSessionId);
+							
+							if (session && session.metadata && session.metadata.contextAccumulated) {
+								const context = session.metadata.contextAccumulated;
+								
+								// Look for similar emails in the accumulated context
+								if (context.emails && Array.isArray(context.emails)) {
+									// Find emails with similar subject or recipients
+									const similarEmail = context.emails.find((email: any) => {
+										// Check if subject is similar (case insensitive, ignoring minor differences)
+										const subjectSimilar = email.subject &&
+											email.subject.toLowerCase().includes(args.subject.toLowerCase()) ||
+											args.subject.toLowerCase().includes(email.subject.toLowerCase());
+										
+										// Check if recipients are similar
+										const recipientsSimilar = email.to_email &&
+											Array.isArray(email.to_email) && Array.isArray(args.to_emails) &&
+											email.to_email.some((to: string) => args.to_emails.includes(to));
+										
+										return subjectSimilar || recipientsSimilar;
+									});
+									
+									if (similarEmail && similarEmail.id) {
+										emailId = similarEmail.id;
+										console.log('📧 Found similar existing draft, updating instead of creating new one:', {
+											emailId,
+											existingSubject: similarEmail.subject,
+											newSubject: args.subject
+										});
+										
+										// Update the existing draft
+										if (emailId) {
+											const updateResult = await this.mcpClient.updateDraftEmail(emailId, {
+												subject: args.subject,
+												body: args.body,
+												to_emails: args.to_emails
+											});
+											
+											if (!updateResult.success) {
+												console.warn('⚠️ Failed to update existing draft, will create new one instead');
+												emailId = null; // Reset to create new draft
+											}
+										}
+									}
+								}
+							}
+						}
+						
+						// If no similar email found or update failed, create a new draft
+						if (!emailId) {
+							console.log('📧 Creating new email draft...');
+							const draftResult = await this.mcpClient.draftEmail({
+								to_emails: args.to_emails,
+								subject: args.subject,
+								body: args.body
+							});
+							
+							if (draftResult.success && draftResult.result && draftResult.result.email_id) {
+								emailId = draftResult.result.email_id;
+							} else {
+								throw new Error('Failed to draft email before sending');
+							}
+						}
+						
+						// Send the email (either updated or newly drafted)
+						if (emailId) {
+							console.log('📧 Sending email...');
+							result = await this.mcpClient.sendEmail(emailId);
+						} else {
+							throw new Error('Failed to obtain email ID for sending');
+						}
+					} else {
+						throw new Error('Either email_id (for existing drafts) or to_emails, subject, and body (for new emails) are required for sending emails');
+					}
+					break;
+	
+				case 'email_read_email':
+					result = await this.mcpClient.readEmails(
+						args.folder || 'inbox',
+						args.limit || 10
+					);
+					break;
+	
+				case 'email_archive_email':
+					// CRITICAL: Ensure email_id is properly passed for archiving emails
+					if (!args.email_id) {
+						throw new Error('email_id is required for archiving emails');
+					}
+					result = await this.mcpClient.archiveEmail(args.email_id);
+					break;
+
+				case 'email_delete_email':
+					// CRITICAL: Ensure email_id is properly passed for deleting emails
+					if (!args.email_id) {
+						throw new Error('email_id is required for deleting emails');
+					}
+					result = await this.mcpClient.deleteEmail(args.email_id);
+					break;
+	
+				// Contacts functions
+				case 'contacts_search':
+					result = await this.mcpClient.searchContacts(args.query, args.limit || 10);
+					break;
+	
+				case 'contacts_get_recent':
+					result = await this.mcpClient.getRecentContacts(args.limit || 10);
+					break;
+	
+				case 'contacts_get_by_company':
+					result = await this.mcpClient.getContactsByCompany(args.company, args.limit || 10);
+					break;
+	
+				case 'contacts_get_all':
+					result = await this.mcpClient.getAllContacts(args.limit || 20);
+					break;
+	
+				// Tasks functions
+				case 'tasks_get_tasks':
+					result = await this.mcpClient.getTasks(args.limit || 20);
+					break;
+	
+				case 'tasks_get_overdue':
+					result = await this.mcpClient.getOverdueTasks();
+					break;
+	
+				case 'tasks_get_today':
+					result = await this.mcpClient.getTodayTasks();
+					break;
+	
+				case 'tasks_create':
+					result = await this.mcpClient.createTask(
+						args.title,
+						args.description,
+						args.due_date
+					);
+					break;
+	
+				case 'tasks_update':
+					result = await this.mcpClient.updateTask(args.task_id, args);
+					break;
+	
+				case 'tasks_delete':
+					result = await this.mcpClient.deleteTask(args.task_id);
+					break;
+	
+				// Activities functions
+				case 'activities_get_feed':
+					result = await this.mcpClient.getActivityFeed(args.limit || 20);
+					break;
+	
+				case 'activities_get_analytics':
+					result = await this.mcpClient.getActivityAnalytics();
+					break;
+	
+				// Queue functions
+				case 'queue_add_job':
+					result = await this.mcpClient.addBackgroundJob(args.jobType, args.parameters);
+					break;
+	
+				case 'queue_get_job_status':
+					result = await this.mcpClient.getJobStatus(args.job_id);
+					break;
+	
+				case 'queue_cancel_job':
+					result = await this.mcpClient.cancelJob(args.job_id);
+					break;
+	
+				// Legacy function names (for backward compatibility)
+				case 'search_contacts':
+					result = await this.mcpClient.searchContacts(args.query, args.limit || 10);
+					break;
+	
+				case 'get_recent_contacts':
+					result = await this.mcpClient.getRecentContacts(args.limit || 10);
+					break;
+	
+				case 'send_email':
+					// Handle both direct email sending and sending existing drafts (legacy function)
+					if (args.email_id) {
+						// Send existing draft
+						result = await this.mcpClient.sendEmail(args.email_id);
+					} else if (args.to_emails && args.subject && args.body) {
+						// Try to find and update an existing draft first, otherwise create a new one
+						console.log('📧 Looking for existing email drafts to update...');
+						
+						// Get accumulated context to find similar emails
+						const currentSession = session;
+						let emailId: string | null = null;
+						
+						if (currentSession && currentSession.metadata && currentSession.metadata.contextAccumulated && currentSession.metadata.contextAccumulated.emails) {
+							const existingEmails = currentSession.metadata.contextAccumulated.emails;
+							
+							// Look for emails with similar subject and recipients that are still in draft status
+							const similarEmail = existingEmails.find(email =>
+								email.subject === args.subject &&
+								email.status === 'draft' &&
+								email.to_emails &&
+								JSON.stringify(email.to_emails.sort()) === JSON.stringify(args.to_emails.sort())
+							);
+							
+							if (similarEmail && similarEmail.email_id) {
+								console.log('📧 Found similar existing draft, updating it instead of creating new one...');
+								emailId = similarEmail.email_id;
+								
+								// Update the existing draft
+								if (emailId) {
+									const updateResult = await this.mcpClient.updateDraftEmail(emailId, {
+										subject: args.subject,
+										body: args.body,
+										to_emails: args.to_emails
+									});
+								
+									if (!updateResult.success) {
+										console.warn('⚠️ Failed to update existing draft, will create new one instead');
+										emailId = null; // Reset to create new draft
+									}
+								}
+							}
+						}
+						
+						// If no similar email found or update failed, create a new draft
+						if (!emailId) {
+							console.log('📧 Creating new email draft...');
+							const draftResult = await this.mcpClient.draftEmail({
+								to_emails: args.to_emails,
+								subject: args.subject,
+								body: args.body
+							});
+							
+							if (draftResult.success && draftResult.result && draftResult.result.email_id) {
+								emailId = draftResult.result.email_id;
+							} else {
+								throw new Error('Failed to draft email before sending');
+							}
+						}
+						
+						// Send the email (either updated or newly drafted)
+						if (emailId) {
+							console.log('📧 Sending email...');
+							result = await this.mcpClient.sendEmail(emailId);
+						} else {
+							throw new Error('Failed to obtain email ID for sending');
+						}
+					} else {
+						throw new Error('Either email_id (for existing drafts) or to_emails, subject, and body (for new emails) are required for sending emails');
+					}
+					break;
+	
+				case 'draft_email':
+					result = await this.mcpClient.draftEmail({
+						to_emails: args.to,
+						subject: args.subject,
+						body: args.body
+					});
+					break;
+	
+				case 'schedule_meeting':
+					result = await this.mcpClient.draftMeeting(
+						args.title,
+						args.attendees,
+						args.start_time,
+						args.duration || 60
+					);
+					break;
+	
+				case 'get_tasks':
+					if (args.status === 'overdue') {
+						result = await this.mcpClient.getOverdueTasks();
+					} else if (args.status === 'today') {
+						result = await this.mcpClient.getTodayTasks();
+					} else {
+						result = await this.mcpClient.getTasks(args.limit || 20);
+					}
+					break;
+	
+				case 'create_task':
+					result = await this.mcpClient.createTask(
+						args.title,
+						args.description,
+						args.due_date
+					);
+					break;
+	
+				case 'read_emails':
+					result = await this.mcpClient.readEmails(
+						args.folder || 'inbox',
+						args.limit || 10
+					);
+					break;
+	
+				// Handle any other function names by directly calling executeAction
+				default:
+					console.log(`🔄 Using direct executeAction for: ${functionName}`);
+					result = await this.mcpClient.executeAction(functionName, args);
+					break;
+			}
+
+			console.log('✅ MCP function executed:', {
+				functionName,
+				success: result.success,
+				hasData: !!result.result,
+				error: result.error
+			});
+
+			// Return the result in a format OpenAI can understand
+			if (result.success) {
+				return {
+					success: true,
+					data: result.result,
+					message: `Successfully executed ${functionName}`
+				};
+			} else {
+				return {
+					success: false,
+					error: result.error || 'Function execution failed',
+					message: `Failed to execute ${functionName}: ${result.error}`
+				};
+			}
+
+		} catch (error) {
+			console.error('❌ MCP function execution error:', error);
+			return {
+				success: false,
+				error: error instanceof Error ? error.message : 'Unknown error',
+				message: `Error executing ${functionName}`
+			};
+		}
 	}
 
 	private async streamOpenAIResponse(
@@ -1037,11 +2031,14 @@ For pronouns and references:
 
 			await this.metadataManager.addMCPResponse(session, action, parameters, result, success, error);
 
-			console.log('✅ MCP response accumulated for session:', {
+			// Save the updated session metadata to database
+			await this.metadataManager.saveSession(session);
+
+			console.log('✅ MCP response accumulated and saved for session:', {
 				sessionId,
 				action,
 				success,
-				totalMCPActions: session.metadata?.mcpResponses?.length || 0
+				totalMCPActions: session.metadata?.totalMCPActions || 0
 			});
 		} catch (error) {
 			console.error('❌ Failed to accumulate MCP response:', error);
@@ -1053,9 +2050,57 @@ For pronouns and references:
 	 */
 	getAccumulatedContext(sessionId: string): string {
 		const session = this.sessions.get(sessionId);
-		if (!session) return '';
+		if (!session || !session.metadata?.contextAccumulated) return '';
 
-		return this.metadataManager.getAccumulatedContext(session);
+		const context = session.metadata.contextAccumulated;
+		let contextString = '';
+
+		// Add contacts
+		if (context.contacts && context.contacts.length > 0) {
+			contextString += '\n📞 EXISTING CONTACTS:';
+			context.contacts.slice(0, 10).forEach((contact, index) => {
+				if (contact.name && contact.email_address) {
+					contextString += '\n' + (index + 1) + '. ' + contact.name + ' <' + contact.email_address + '>';
+					if (contact.company) contextString += ' (' + contact.company + ')';
+				}
+			});
+		}
+
+		// Add meetings
+		if (context.meetings && context.meetings.length > 0) {
+			contextString += '\n📅 EXISTING MEETINGS:';
+			context.meetings.slice(0, 5).forEach((meeting, index) => {
+				if (meeting.subject) {
+					contextString += '\n' + (index + 1) + '. ' + meeting.subject;
+					if (meeting.startTime) contextString += ' (' + meeting.startTime + ')';
+				}
+			});
+		}
+
+		// Add emails with more detailed information including IDs
+		if (context.emails && context.emails.length > 0) {
+			contextString += '\n📧 EXISTING EMAILS (USE THESE IDs FOR EMAIL OPERATIONS):';
+			context.emails.slice(0, 5).forEach((email, index) => {
+				if (email.subject) {
+					contextString += '\n' + (index + 1) + '. ' + email.subject;
+					// CRITICAL: Always show email_id as it's essential for email operations
+					if (email.email_id) {
+						contextString += ' (ID: ' + email.email_id + ')';
+					} else if (email.id) {
+						contextString += ' (ID: ' + email.id + ')';
+					}
+					if (email.status) contextString += ' [Status: ' + email.status + ']';
+					if (email.from) contextString += ' (from: ' + email.from + ')';
+					if (email.to_emails && email.to_emails.length > 0) {
+						contextString += ' (to: ' + email.to_emails.join(', ') + ')';
+					}
+				}
+			});
+			contextString += '\n\n  👉 IMPORTANT: Use the EXACT email IDs shown above when calling email functions!';
+			contextString += '\n  👉 EXAMPLE: To update email #1, use email_id: "' + (context.emails[0]?.email_id || context.emails[0]?.id || 'REAL_ID_HERE') + '"';
+		}
+
+		return contextString;
 	}
 
 	/**
@@ -1301,4 +2346,130 @@ For pronouns and references:
 			console.error('❌ Failed to save MCP cache to storage:', error);
 		}
 	}
+
+	/**
+	 * Merge AI-generated structured context with existing context
+	 */
+	private mergeAIContext(existingContext: any, aiContext: any): void {
+		try {
+			
+			// Merge contacts
+			if (aiContext.contacts && Array.isArray(aiContext.contacts)) {
+				existingContext.contacts = existingContext.contacts || [];
+				aiContext.contacts.forEach((newContact: any) => {
+					// Check if contact already exists (deduplication by id or email)
+					const existingIndex = existingContext.contacts.findIndex((existing: any) => 
+						existing.id === newContact.id || existing.email_address === newContact.email_address
+					);
+					
+					if (existingIndex >= 0) {
+						// Update existing contact
+						existingContext.contacts[existingIndex] = { ...existingContext.contacts[existingIndex], ...newContact };
+						console.log('🔄 Updated existing contact:', newContact.name);
+					} else {
+						// Add new contact
+						existingContext.contacts.push(newContact);
+						console.log('✅ Added new contact:', newContact.name);
+					}
+				});
+			}
+
+			// Merge meetings
+			if (aiContext.meetings && Array.isArray(aiContext.meetings)) {
+				existingContext.meetings = existingContext.meetings || [];
+				aiContext.meetings.forEach((newMeeting: any) => {
+					const existingIndex = existingContext.meetings.findIndex((existing: any) => 
+						existing.id === newMeeting.id || (existing.subject === newMeeting.subject && existing.to_email === newMeeting.to_email)
+					);
+					
+					if (existingIndex >= 0) {
+						existingContext.meetings[existingIndex] = { ...existingContext.meetings[existingIndex], ...newMeeting };
+						console.log('🔄 Updated existing meeting:', newMeeting.subject);
+					} else {
+						existingContext.meetings.push(newMeeting);
+						console.log('✅ Added new meeting:', newMeeting.subject);
+					}
+				});
+			}
+
+			// Merge calendar
+			if (aiContext.calendar && Array.isArray(aiContext.calendar)) {
+				existingContext.calendar = existingContext.calendar || [];
+				aiContext.calendar.forEach((newCalendar: any) => {
+					const existingIndex = existingContext.calendar.findIndex((existing: any) => 
+						existing.id === newCalendar.id || existing.subject === newCalendar.subject
+					);
+					
+					if (existingIndex >= 0) {
+						existingContext.calendar[existingIndex] = { ...existingContext.calendar[existingIndex], ...newCalendar };
+						console.log('🔄 Updated existing calendar:', newCalendar.subject);
+					} else {
+						existingContext.calendar.push(newCalendar);
+						console.log('✅ Added new calendar:', newCalendar.subject);
+					}
+				});
+			}
+
+			// Merge emails
+			if (aiContext.emails && Array.isArray(aiContext.emails)) {
+				existingContext.emails = existingContext.emails || [];
+				aiContext.emails.forEach((newEmail: any) => {
+					// CRITICAL: Always prioritize email_id for deduplication as it's essential for email operations
+					const existingIndex = existingContext.emails.findIndex((existing: any) =>
+						existing.email_id === newEmail.email_id ||
+						(existing.id === newEmail.id && !newEmail.email_id) ||
+						(!existing.email_id && !newEmail.email_id && existing.subject === newEmail.subject && existing.from === newEmail.from)
+					);
+					
+					if (existingIndex >= 0) {
+						// When merging, ensure we preserve the email_id if it exists in either record
+						const mergedEmail = { ...existingContext.emails[existingIndex], ...newEmail };
+						if (!mergedEmail.email_id) {
+							mergedEmail.email_id = existingContext.emails[existingIndex].email_id || newEmail.email_id || newEmail.id;
+						}
+						existingContext.emails[existingIndex] = mergedEmail;
+						console.log('🔄 Updated existing email:', newEmail.subject, '(ID:', mergedEmail.email_id, ')');
+					} else {
+						// Ensure new email has email_id set
+						if (!newEmail.email_id && newEmail.id) {
+							newEmail.email_id = newEmail.id;
+						}
+						existingContext.emails.push(newEmail);
+						console.log('✅ Added new email:', newEmail.subject, '(ID:', newEmail.email_id || newEmail.id, ')');
+					}
+				});
+			}
+
+			// Merge tasks
+			if (aiContext.tasks && Array.isArray(aiContext.tasks)) {
+				existingContext.tasks = existingContext.tasks || [];
+				aiContext.tasks.forEach((newTask: any) => {
+					const existingIndex = existingContext.tasks.findIndex((existing: any) => 
+						existing.id === newTask.id || existing.title === newTask.title
+					);
+					
+					if (existingIndex >= 0) {
+						existingContext.tasks[existingIndex] = { ...existingContext.tasks[existingIndex], ...newTask };
+						console.log('🔄 Updated existing task:', newTask.title);
+					} else {
+						existingContext.tasks.push(newTask);
+						console.log('✅ Added new task:', newTask.title);
+					}
+				});
+			}
+
+			// Keep arrays manageable (max 20 items each)
+			Object.keys(existingContext).forEach(key => {
+				if (Array.isArray(existingContext[key]) && existingContext[key].length > 20) {
+					existingContext[key] = existingContext[key].slice(-20);
+				}
+			});
+
+			console.log('✅ AI context merged successfully');
+
+		} catch (error) {
+			console.error('❌ Failed to merge AI context:', error);
+		}
+	}
+
 }

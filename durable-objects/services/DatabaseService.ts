@@ -140,10 +140,27 @@ export class DatabaseService {
 				totalMCPActions: 0
 			};
 
-			// Add new MCP response
-			metadata.mcpResponses.push(mcpResponse);
+			// Add new MCP response (store only essential data to prevent bloat)
+			const compactResponse = {
+				id: mcpResponse.id,
+				action: mcpResponse.action,
+				success: mcpResponse.success,
+				timestamp: mcpResponse.timestamp,
+				error: mcpResponse.error,
+				// Store only a summary of the result, not the full data
+				resultSummary: this.createResultSummary(mcpResponse.result, mcpResponse.action),
+				metadata: {
+					sessionId: mcpResponse.metadata.sessionId,
+					userId: mcpResponse.metadata.userId,
+					workspaceId: mcpResponse.metadata.workspaceId,
+					responseSize: mcpResponse.metadata.responseSize
+				}
+			};
+			
+			metadata.mcpResponses.push(compactResponse);
 			metadata.lastMCPInteraction = new Date();
-			metadata.totalMCPActions = metadata.mcpResponses.length;
+			// Increment total count instead of using array length
+			metadata.totalMCPActions = (metadata.totalMCPActions || 0) + 1;
 
 			// Try to update existing session first
 			let response = await fetch(`${this.supabaseUrl}/rest/v1/chat_sessions?id=eq.${sessionId}`, {
@@ -282,5 +299,91 @@ export class DatabaseService {
 			console.error('❌ Database service error saving message:', error);
 			// Don't throw - we don't want database failures to break chat
 		}
+	}
+
+	/**
+	 * Create a compact summary of MCP result data to prevent storage bloat
+	 */
+	private createResultSummary(result: any, action: string): any {
+		if (!result) return null;
+
+		const actionLower = action.toLowerCase();
+
+		// For contact-related actions
+		if (actionLower.includes('contact')) {
+			if (Array.isArray(result.contacts)) {
+				return {
+					type: 'contacts',
+					count: result.contacts.length,
+					total: result.total,
+					success: result.success,
+					sample: result.contacts.slice(0, 3).map((c: any) => ({
+						name: c.name,
+						email: c.email,
+						company: c.company
+					}))
+				};
+			}
+		}
+
+		// For email-related actions
+		if (actionLower.includes('email')) {
+			if (Array.isArray(result.emails)) {
+				return {
+					type: 'emails',
+					count: result.emails.length,
+					total: result.total,
+					success: result.success,
+					sample: result.emails.slice(0, 3).map((e: any) => ({
+						subject: e.subject,
+						from: e.from,
+						date: e.date
+					}))
+				};
+			}
+		}
+
+		// For calendar/meeting actions
+		if (actionLower.includes('calendar') || actionLower.includes('meeting')) {
+			if (Array.isArray(result.meetings)) {
+				return {
+					type: 'meetings',
+					count: result.meetings.length,
+					total: result.total,
+					success: result.success,
+					sample: result.meetings.slice(0, 3).map((m: any) => ({
+						title: m.title,
+						startTime: m.startTime,
+						attendees: m.attendees?.length || 0
+					}))
+				};
+			}
+		}
+
+		// For task actions
+		if (actionLower.includes('task')) {
+			if (Array.isArray(result.tasks)) {
+				return {
+					type: 'tasks',
+					count: result.tasks.length,
+					total: result.total,
+					success: result.success,
+					sample: result.tasks.slice(0, 3).map((t: any) => ({
+						title: t.title,
+						status: t.status,
+						dueDate: t.dueDate
+					}))
+				};
+			}
+		}
+
+		// Generic fallback for other actions
+		return {
+			type: 'generic',
+			success: result.success || true,
+			hasData: !!result,
+			dataType: Array.isArray(result) ? 'array' : typeof result,
+			size: JSON.stringify(result).length
+		};
 	}
 }

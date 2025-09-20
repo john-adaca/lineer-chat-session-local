@@ -294,13 +294,15 @@
                     document.getElementById('connectBtn').disabled = true;
                     document.getElementById('disconnectBtn').disabled = false;
                 };
-
+                let la
                 ws.onmessage = function(event) {
                     try {
+                        let lastMessage = ''
                         const data = JSON.parse(event.data);
                         addMessage(`Received: ${data.type} - ${data.content || 'No content'}`, 'received', data);
+                        lastMessage = data.content
                     } catch (error) {
-                        addMessage(`Received: ${event.data}`, 'received');
+                        addMessage(lastMessage)
                     }
                 };
 

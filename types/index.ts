@@ -37,6 +37,17 @@ export interface ChatSession {
 		createdFromUI: boolean;
 		lastMCPInteraction: Date | null;
 		totalMCPActions: number;
+		aiSummaries?: Array<{
+			action: string;
+			summary: string;
+			timestamp: Date;
+			rawDataSize: number;
+		}>;
+		lastActionResult?: Record<string, {
+			result: any;
+			timestamp: Date;
+			parameters: any;
+		}>;
 	};
 }
 
@@ -49,7 +60,14 @@ export interface MCPResponse {
 	timestamp: Date;
 	success: boolean;
 	error?: string;
-	metadata?: any;
+	errorType?: string;
+	metadata?: {
+		responseSize?: number;
+		executionTime?: number;
+		originalError?: string;
+		retryable?: boolean;
+		[key: string]: any;
+	};
 }
 
 // AI Stream Chunk Types

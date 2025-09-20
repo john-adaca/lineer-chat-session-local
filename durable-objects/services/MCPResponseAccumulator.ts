@@ -1,11 +1,14 @@
 import type { MCPResponse, ChatSession } from '../../types';
 import { DatabaseService } from './DatabaseService';
+import { AIContextSummarizer } from './AIContextSummarizer';
 
 export class MCPResponseAccumulator {
 	private databaseService: DatabaseService;
+	private aiSummarizer: AIContextSummarizer;
 
-	constructor(databaseService: DatabaseService) {
+	constructor(databaseService: DatabaseService, aiService?: any) {
 		this.databaseService = databaseService;
+		this.aiSummarizer = new AIContextSummarizer(aiService);
 	}
 
 	/**
@@ -17,7 +20,7 @@ export class MCPResponseAccumulator {
 				id: `mcp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
 				action,
 				parameters,
-				result,
+				result, // Keep full result for AI processing, but don't store in mcpResponses array
 				timestamp: new Date(),
 				success,
 				error,
@@ -41,13 +44,30 @@ export class MCPResponseAccumulator {
 				};
 			}
 
-			// Add to in-memory session
-			session.metadata.mcpResponses.push(mcpResponse);
+			// Add to in-memory session (store only essential data, not full result)
+			const compactResponse = {
+				id: mcpResponse.id,
+				action: mcpResponse.action,
+				success: mcpResponse.success,
+				timestamp: mcpResponse.timestamp,
+				error: mcpResponse.error,
+				parameters: mcpResponse.parameters,
+				result: null, // Don't store full result
+				// Store only a summary, not the full result data
+				resultSummary: this.createCompactSummary(result, action),
+				metadata: mcpResponse.metadata
+			};
+			
+			session.metadata.mcpResponses.push(compactResponse as MCPResponse);
+			if (session.metadata.mcpResponses.length > 10) {
+				session.metadata.mcpResponses = session.metadata.mcpResponses.slice(-10);
+			}
 			session.metadata.lastMCPInteraction = new Date();
-			session.metadata.totalMCPActions = session.metadata.mcpResponses.length;
-
-			// Accumulate context based on action type
-			this.accumulateContext(session, mcpResponse);
+			// Increment total count instead of using array length
+			session.metadata.totalMCPActions = (session.metadata.totalMCPActions || 0) + 1;
+	
+			// Use AI to intelligently summarize and merge context
+			await this.summarizeContextWithAI(session, mcpResponse);
 
 			// Save to database
 			await this.databaseService.updateMCPResponses(session.id, mcpResponse, session.userId, session.workspaceId);
@@ -65,9 +85,47 @@ export class MCPResponseAccumulator {
 	}
 
 	/**
-	 * Accumulate context from MCP responses for future AI interactions
+	 * Use AI to intelligently summarize and merge context
 	 */
-	private accumulateContext(session: ChatSession, mcpResponse: MCPResponse): void {
+	private async summarizeContextWithAI(session: ChatSession, mcpResponse: MCPResponse): Promise<void> {
+		if (!session.metadata) return;
+
+		try {
+			console.log('🤖 Starting AI context summarization for action:', mcpResponse.action);
+
+			// Get current context
+			const currentContext = session.metadata.contextAccumulated || {};
+
+			// Use AI to summarize and merge
+			const summarizedContext = await this.aiSummarizer.summarizeContext(
+				{ contextAccumulated: currentContext },
+				mcpResponse,
+				session
+			);
+
+			// Update session metadata with AI-summarized context
+			session.metadata.contextAccumulated = summarizedContext;
+
+			console.log('✅ AI context summarization completed:', {
+				contactsCount: summarizedContext.contacts?.length || 0,
+				emailsCount: summarizedContext.emails?.length || 0,
+				meetingsCount: summarizedContext.meetings?.length || 0,
+				tasksCount: summarizedContext.tasks?.length || 0,
+				hasSummary: !!summarizedContext.summary
+			});
+
+		} catch (error) {
+			console.error('❌ AI context summarization failed, using fallback:', error);
+			
+			// Fallback to simple context update
+			this.fallbackContextUpdate(session, mcpResponse);
+		}
+	}
+
+	/**
+	 * Fallback context update if AI summarization fails
+	 */
+	private fallbackContextUpdate(session: ChatSession, mcpResponse: MCPResponse): void {
 		if (!session.metadata) return;
 
 		const context = session.metadata.contextAccumulated;
@@ -79,140 +137,40 @@ export class MCPResponseAccumulator {
 		if (!context.tasks) context.tasks = [];
 		if (!context.recentActions) context.recentActions = [];
 
-		// Extract and accumulate context based on action type
+		// Simple fallback: add new data without AI intelligence
 		const action = mcpResponse.action.toLowerCase();
-		console.log('🔄 Accumulating context for action:', action, {
-			hasResult: !!mcpResponse.result,
-			resultType: Array.isArray(mcpResponse.result) ? 'array' : typeof mcpResponse.result
-		});
-
-		if (action.includes('contact')) {
-			this.accumulateContactContext(context, mcpResponse);
-		} else if (action.includes('email')) {
-			this.accumulateEmailContext(context, mcpResponse);
-		} else if (action.includes('calendar') || action.includes('meeting')) {
-			this.accumulateMeetingContext(context, mcpResponse);
-		} else if (action.includes('task')) {
-			this.accumulateTaskContext(context, mcpResponse);
-		}
-
-		console.log('📊 Context accumulated:', {
-			contactsCount: context.contacts?.length || 0,
-			emailsCount: context.emails?.length || 0,
-			meetingsCount: context.meails?.length || 0,
-			tasksCount: context.tasks?.length || 0,
-			recentActionsCount: context.recentActions?.length || 0
-		});
-
-		// Always add to recent actions (keep last 10)
-		context.recentActions.unshift({
-			action: mcpResponse.action,
-			timestamp: mcpResponse.timestamp,
-			success: mcpResponse.success,
-			result: mcpResponse.result
-		});
-		context.recentActions = context.recentActions.slice(0, 10);
-	}
-
-	private accumulateContactContext(context: any, response: MCPResponse): void {
-		console.log('👥 Accumulating contact context:', {
-			success: response.success,
-			hasResult: !!response.result,
-			resultLength: Array.isArray(response.result) ? response.result.length : 1
-		});
-
-		if (response.success && response.result) {
-			const contacts = Array.isArray(response.result) ? response.result : [response.result];
-			console.log('📞 Processing contacts:', contacts.map(c => ({ id: c.id, name: c.name })));
-
-			contacts.forEach((contact: any) => {
+		
+		if (action.includes('contact') && mcpResponse.success && mcpResponse.result) {
+			const contacts = Array.isArray(mcpResponse.result) ? mcpResponse.result : [mcpResponse.result];
+			contacts.slice(0, 3).forEach((contact: any) => {
 				if (contact.id && contact.name) {
 					context.contacts.push({
 						id: contact.id,
 						name: contact.name,
 						email: contact.email,
-						lastInteraction: response.timestamp,
-						source: response.action
-					});
-					console.log('✅ Added contact to context:', contact.name);
-				} else {
-					console.log('⚠️ Skipping contact - missing id or name:', contact);
-				}
-			});
-
-			// Keep only unique contacts (by ID)
-			const beforeCount = context.contacts.length;
-			context.contacts = context.contacts.filter((contact: any, index: number, self: any[]) =>
-				index === self.findIndex((c: any) => c.id === contact.id)
-			);
-			const afterCount = context.contacts.length;
-
-			console.log('🧹 Contact deduplication:', { before: beforeCount, after: afterCount });
-		} else {
-			console.log('❌ Not accumulating contacts - no result or failed response');
-		}
-	}
-
-	private accumulateEmailContext(context: any, response: MCPResponse): void {
-		if (response.success && response.result) {
-			const emails = Array.isArray(response.result) ? response.result : [response.result];
-			emails.forEach((email: any) => {
-				if (email.id || email.subject) {
-					context.emails.push({
-						id: email.id,
-						subject: email.subject,
-						from: email.from,
-						to: email.to,
-						timestamp: response.timestamp,
-						source: response.action
+						lastInteraction: mcpResponse.timestamp,
+						source: mcpResponse.action
 					});
 				}
 			});
-			// Keep last 20 emails
-			context.emails = context.emails.slice(0, 20);
 		}
+
+		// Keep arrays manageable
+		context.contacts = context.contacts.slice(-10);
+		context.emails = context.emails.slice(-8);
+		context.meetings = context.meetings.slice(-6);
+		context.tasks = context.tasks.slice(-8);
+
+		// Add to recent actions
+		context.recentActions.unshift({
+			action: mcpResponse.action,
+			timestamp: mcpResponse.timestamp,
+			success: mcpResponse.success,
+			result: 'Brief description'
+		});
+		context.recentActions = context.recentActions.slice(0, 10);
 	}
 
-	private accumulateMeetingContext(context: any, response: MCPResponse): void {
-		if (response.success && response.result) {
-			const meetings = Array.isArray(response.result) ? response.result : [response.result];
-			meetings.forEach((meeting: any) => {
-				if (meeting.id || meeting.title) {
-					context.meetings.push({
-						id: meeting.id,
-						title: meeting.title,
-						startTime: meeting.startTime || meeting.start,
-						endTime: meeting.endTime || meeting.end,
-						attendees: meeting.attendees || [],
-						timestamp: response.timestamp,
-						source: response.action
-					});
-				}
-			});
-			// Keep last 10 meetings
-			context.meetings = context.meetings.slice(0, 10);
-		}
-	}
-
-	private accumulateTaskContext(context: any, response: MCPResponse): void {
-		if (response.success && response.result) {
-			const tasks = Array.isArray(response.result) ? response.result : [response.result];
-			tasks.forEach((task: any) => {
-				if (task.id || task.title) {
-					context.tasks.push({
-						id: task.id,
-						title: task.title,
-						status: task.status,
-						dueDate: task.dueDate,
-						timestamp: response.timestamp,
-						source: response.action
-					});
-				}
-			});
-			// Keep last 20 tasks
-			context.tasks = context.tasks.slice(0, 20);
-		}
-	}
 
 	/**
 	 * Get accumulated context for AI prompt
@@ -224,45 +182,12 @@ export class MCPResponseAccumulator {
 		}
 
 		const context = session.metadata.contextAccumulated;
-		let contextString = '';
-
-	
-		// Recent contacts
-		if (context.contacts?.length > 0) {
-			const contactDetails = context.contacts.slice(0, 5).map((c: any) =>
-				c.email ? `${c.name} (${c.email})` : c.name
-			).join(', ');
-			contextString += `\nRecent contacts: ${contactDetails}`;
-		}
-
-		// Recent emails
-		if (context.emails?.length > 0) {
-			const emailSubjects = context.emails.slice(0, 3).map((e: any) => e.subject).join(', ');
-			contextString += `\nRecent email subjects: ${emailSubjects}`;
-		}
-
-		// Upcoming meetings
-		if (context.meetings?.length > 0) {
-			const meetingTitles = context.meetings.slice(0, 3).map((m: any) => m.title).join(', ');
-			contextString += `\nRecent meetings: ${meetingTitles}`;
-		}
-
-		// Recent tasks
-		if (context.tasks?.length > 0) {
-			const taskTitles = context.tasks.slice(0, 3).map((t: any) => t.title).join(', ');
-			contextString += `\nRecent tasks: ${taskTitles}`;
-			console.log('✅ Added tasks to context:', taskTitles);
-		}
-
-		// Recent actions
-		if (context.recentActions?.length > 0) {
-			const recentActionNames = context.recentActions.slice(0, 3).map((a: any) => a.action).join(', ');
-			contextString += `\nRecent actions: ${recentActionNames}`;
-			console.log('✅ Added recent actions to context:', recentActionNames);
-		}
-
-		console.log('📝 Final context string:', contextString || '(empty)');
-		return contextString;
+		
+		// Use AI summarizer to get intelligent context summary
+		const contextSummary = this.aiSummarizer.getContextSummary(context);
+		
+		console.log('📝 AI-generated context summary:', contextSummary || '(empty)');
+		return contextSummary;
 	}
 
 	/**
@@ -286,5 +211,86 @@ export class MCPResponseAccumulator {
 		});
 
 		return stats;
+	}
+
+	/**
+	 * Create a compact summary of MCP result data to prevent storage bloat
+	 */
+	private createCompactSummary(result: any, action: string): any {
+		if (!result) return null;
+
+		const actionLower = action.toLowerCase();
+
+		// For contact-related actions
+		if (actionLower.includes('contact')) {
+			if (Array.isArray(result.contacts)) {
+				return {
+					type: 'contacts',
+					count: result.contacts.length,
+					total: result.total,
+					success: result.success,
+					sample: result.contacts.slice(0, 2).map((c: any) => ({
+						name: c.name,
+						email: c.email
+					}))
+				};
+			}
+		}
+
+		// For email-related actions
+		if (actionLower.includes('email')) {
+			if (Array.isArray(result.emails)) {
+				return {
+					type: 'emails',
+					count: result.emails.length,
+					total: result.total,
+					success: result.success,
+					sample: result.emails.slice(0, 2).map((e: any) => ({
+						subject: e.subject,
+						from: e.from
+					}))
+				};
+			}
+		}
+
+		// For calendar/meeting actions
+		if (actionLower.includes('calendar') || actionLower.includes('meeting')) {
+			if (Array.isArray(result.meetings)) {
+				return {
+					type: 'meetings',
+					count: result.meetings.length,
+					total: result.total,
+					success: result.success,
+					sample: result.meetings.slice(0, 2).map((m: any) => ({
+						title: m.title,
+						startTime: m.startTime
+					}))
+				};
+			}
+		}
+
+		// For task actions
+		if (actionLower.includes('task')) {
+			if (Array.isArray(result.tasks)) {
+				return {
+					type: 'tasks',
+					count: result.tasks.length,
+					total: result.total,
+					success: result.success,
+					sample: result.tasks.slice(0, 2).map((t: any) => ({
+						title: t.title,
+						status: t.status
+					}))
+				};
+			}
+		}
+
+		// Generic fallback for other actions
+		return {
+			type: 'generic',
+			success: result.success || true,
+			hasData: !!result,
+			dataType: Array.isArray(result) ? 'array' : typeof result
+		};
 	}
 }

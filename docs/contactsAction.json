@@ -12,7 +12,7 @@
                         "type": "string",
                         "description": "Workspace identifier"
                     },
-                    "query": {
+                    "search_term": {
                         "type": "string",
                         "description": "Search query (name, email, company, phone)"
                     },
