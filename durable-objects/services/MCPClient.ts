@@ -42,8 +42,8 @@ export class MCPClient {
 				params: {
 					name: action,
 					arguments: {
-						workspace_id: this.context.workspaceId || '14f49f8a-1e2f-4159-abf9-bbff0078bfa9',
-						user_id: this.context.userId || '330c7620-2914-4a5c-8d5f-e4bac4737d08',
+						workspace_id: this.context.workspaceId,
+						user_id: this.context.userId,
 						...parameters
 					}
 				},
@@ -195,12 +195,11 @@ export class MCPClient {
 	 */
 	async updateDraftEmail(emailId: string, updateData: { subject?: string; body?: string; to_emails?: string[]; cc_emails?: string[]; bcc_emails?: string[] }): Promise<MCPResponse> {
 		// Map the parameters to what the MCP server expects
-		console.log("----------------------------- , e" , emailId)
+
 		const parameters = {
 			email_id: emailId,
 			...updateData
 		};
-		console.log("----------------------------- , p" , parameters)
 		return this.executeAction('email_update_draft', parameters);
 	}
 
@@ -235,34 +234,52 @@ export class MCPClient {
 	/**
 	 * Draft a meeting
 	 */
-	async draftMeeting(title: string, attendees: string[], startTime: string, duration: number = 60): Promise<MCPResponse> {
-		return this.executeAction('meeting_draft_meeting', {
+	async draftMeeting(title: string, attendees: string[], startTime: string, duration: number = 60, description?: string): Promise<MCPResponse> {
+		// Calculate end time from start time and duration
+		const start = new Date(startTime);
+		const end = new Date(start.getTime() + (duration * 60 * 1000)); // duration in minutes
+		const endTime = end.toISOString();
+
+		const params: any = {
 			title,
-			attendees,
 			start_time: startTime,
-			duration
-		});
+			end_time: endTime,
+			attendee_emails: attendees
+		};
+
+		// Add description if provided
+		if (description) {
+			params.description = description;
+		}
+
+		return this.executeAction('calendar_draft_event', params);
 	}
 
 	/**
 	 * Send meeting invite
 	 */
 	async sendMeetingInvite(meetingId: string): Promise<MCPResponse> {
-		return this.executeAction('meeting_send_invite', { meetingId });
+		return this.executeAction('calendar_send_event', { 
+			meeting_id: meetingId 
+		});
 	}
 
 	/**
 	 * List meetings
 	 */
 	async listMeetings(limit: number = 10): Promise<MCPResponse> {
-		return this.executeAction('meeting_list_meetings', { limit });
+		return this.executeAction('calendar_list_events', { 
+			limit 
+		});
 	}
 
 	/**
 	 * Cancel meeting
 	 */
 	async cancelMeeting(meetingId: string): Promise<MCPResponse> {
-		return this.executeAction('meeting_cancel_meeting', { meetingId });
+		return this.executeAction('calendar_cancel_event', { 
+			meeting_id: meetingId 
+		});
 	}
 
 	/**

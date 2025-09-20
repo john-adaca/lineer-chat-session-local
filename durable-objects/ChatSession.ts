@@ -1234,7 +1234,7 @@ IMPORTANT: Use the ACTUAL email_id from the existing context data, not placehold
 					model: 'gpt-3.5-turbo',
 					messages: [{
 						role: 'user',
-						content: prompt + '\n\nIMPORTANT: Respond with ONLY a valid JSON object matching the structure shown in the example. Do not include any other text or explanation.\n\nCRITICAL: For emails, always include the email_id field when available, as this is needed for operations like sending emails. The email_id is essential for email operations and should be preserved from the original data.'
+						content: prompt + '\n\nIMPORTANT: Respond with ONLY a valid JSON object matching the structure shown in the example. Do not include any other text or explanation.\n\nCRITICAL: \n1. All property names MUST be quoted (e.g., "contacts", "emails", "email_id")\n2. For emails, always include the email_id field when available, as this is needed for operations like sending emails\n3. The email_id is essential for email operations and should be preserved from the original data\n4. Return valid JSON that can be parsed directly without modification'
 					}],
 					max_tokens: 1000, // More tokens for structured data
 					temperature: 0.1 // Very consistent for JSON
@@ -1253,11 +1253,18 @@ IMPORTANT: Use the ACTUAL email_id from the existing context data, not placehold
 
 			// Try to parse the JSON response
 			try {
+				// First try parsing as-is
 				return JSON.parse(content);
 			} catch (parseError) {
-				console.error('Failed to parse AI response as JSON:', parseError);
-				console.log('AI Response:', content);
-				return null;
+				// If that fails, try cleaning unquoted property names
+				try {
+					const cleanedContent = content.replace(/(\w+):/g, '"$1":');
+					return JSON.parse(cleanedContent);
+				} catch (secondParseError) {
+					console.error('Failed to parse AI response as JSON:', parseError);
+					console.log('AI Response:', content);
+					return null;
+				}
 			}
 
 		} catch (error) {
@@ -1583,7 +1590,8 @@ IMPORTANT: Use the ACTUAL email_id from the existing context data, not placehold
 						args.title,
 						args.attendee_emails || args.attendees,
 						args.start_time,
-						args.duration || 60
+						args.duration || 60,
+						args.description
 					);
 					break;
 	
