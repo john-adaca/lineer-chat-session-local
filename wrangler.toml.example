@@ -1,0 +1,78 @@
+# ChatSession Durable Objects - Wrangler Configuration Example
+# Copy this file to wrangler.toml and update with your actual values
+
+name = "lineer-chat-workers"
+main = "src/index.ts"
+compatibility_date = "2024-07-31"
+
+# Durable Objects configuration
+[[durable_objects.bindings]]
+name = "CHAT_SESSION"
+class_name = "ChatSession"
+
+# Environment variables - Development
+[env.development.vars]
+# Replace these with your actual development values
+SUPABASE_URL = "https://your-project.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY = "your-supabase-service-role-key-here"
+OPENAI_API_KEY = "your-openai-api-key-here"
+MCP_SERVER_URL = "https://your-mcp-server.com"
+
+# Environment variables - Production
+[env.production.vars]
+# Replace these with your actual production values
+SUPABASE_URL = "https://your-production-project.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY = "your-production-supabase-key-here"
+OPENAI_API_KEY = "your-production-openai-key-here"
+MCP_SERVER_URL = "https://your-production-mcp-server.com"
+
+# Development settings
+[env.development]
+durable_objects.persist = true
+# Optional: Local development settings
+local_port = 8787
+local_protocol = "http"
+
+# Production settings
+[env.production]
+durable_objects.persist = true
+# Optional: Production-specific settings
+# zone_id = "your-cloudflare-zone-id" # Uncomment if using custom domains
+
+# Optional: Custom domains and routes (uncomment and customize as needed)
+# [env.production.routes]
+# patterns = [
+#   "your-domain.com/api/*",
+#   "your-domain.com/*"
+# ]
+
+# Optional: KV Storage for caching (uncomment if needed)
+# [[kv_namespaces]]
+# binding = "CACHE_NAMESPACE"
+# id = "your-kv-namespace-id"
+# preview_id = "your-preview-kv-namespace-id"
+
+# Optional: Cron triggers for maintenance tasks (uncomment if needed)
+# [triggers]
+# crons = ["0 2 * * *"] # Run daily at 2 AM UTC
+
+# Optional: Build configuration (uncomment if needed)
+# [build]
+# command = "npm run build"
+# cwd = "."
+# watch_dir = "src"
+
+# Optional: Logging configuration
+# [env.production.logpush]
+# enabled = true
+# dataset = "your-logpush-dataset-id"
+
+# Optional: Limits and timeouts (adjust as needed)
+# [env.production.limits]
+# cpu_ms = 30000
+# memory_mb = 128
+# concurrent_requests = 1000
+
+# Optional: Placement hints (uncomment for specific regions)
+# [env.production.placement]
+# mode = "smart"
